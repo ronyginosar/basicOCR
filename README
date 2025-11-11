@@ -1,0 +1,11 @@
+minimal, working Node + Tesseract.js pipeline that:
+
+OCRs a single image in Hebrew
+
+Writes the raw TSV
+
+Crops each symbol (glyph) to individual PNGs
+
+Saves a compact metadata.json per crop
+
+Later: generalize to batch folders, per-glyph buckets, and GlyphCollector-style functions. (see : https://github.com/krksgbr/glyphcollector)

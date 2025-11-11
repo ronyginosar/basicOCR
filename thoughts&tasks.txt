@@ -1,0 +1,18 @@
+1. the confidence is high even when crop is not good - mid-2-letters.
+2. sometimes high confidence for wrong letter, although crop is good 
+3. cant be a ui solution since probably wont run this one by one
+4. not just heb? and in high conf. tries to use the closest visual 
+5. future - add padding for each crop to get the full letter nuances
+
+
+
+
+
+
+UI & functions:
+
+1. no feedback that an image was uploaded
+2. log - keep scroll bar
+3. hover feedback
+4. cmd line run + folder-sub-folder run?
+5. give each image delete icon or checkbox - so we can edit the image pool before download for cleaness

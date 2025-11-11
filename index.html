@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Hebrew OCR — Tesseract.js (Web)</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Tesseract.js (browser) -->
+  <!-- <script src="https://unpkg.com/tesseract.js@5.0.5/dist/tesseract.min.js"></script> -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+  <!-- JSZip + FileSaver for ZIP downloads -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Hebrew OCR (Tesseract.js)</h1>
+    <p>Choose image(s), run OCR, download TSV + crops + metadata.</p>
+  </header>
+
+  <section class="controls">
+    <label class="file">
+      <input id="fileInput" type="file" accept="image/*,.tif,.tiff,.pdf" multiple />
+      <span>Select images…</span>
+    </label>
+
+    <!-- I'm removing level since I only want symbols (glyphs), but keeping it here for future option -->
+    <!-- <label>
+      Level:
+      <select id="level">
+        <option value="symbols" selected>symbols (glyphs)</option>
+        <option value="words">words</option>
+      </select>
+    </label> -->
+
+    <label>
+      <input id="onlyHebrew" type="checkbox" checked />
+      Keep only Hebrew chars (U+0590–U+05FF)
+    </label>
+
+    <!-- restore if we want to:
+      offline deployments (no CDN): you host your own tessdata/heb.traineddata and point to ./tessdata.
+      custom training: you’ve trained a specialized Hebrew model and want to load it instead of the default one.
+      network-restricted environments (some institutions block CDN calls). -->
+    <!-- <label>
+      Tessdata URL:
+      <input id="langPath" type="text" size="36"
+        value="https://tessdata.projectnaptha.com/4.0.0" />
+    </label> -->
+
+    <button id="runBtn">Run OCR</button>
+    <button id="dlZipBtn" disabled>Download ZIP (crops + TSV + JSON)</button>
+  </section>
+
+  <section class="log">
+    <pre id="log"></pre>
+  </section>
+
+  <section>
+    <h2>Crop Gallery</h2>
+    <div id="gallery" class="gallery"></div>
+  </section>
+
+  <!-- hidden work canvas -->
+  <canvas id="workCanvas" style="display:none;"></canvas>
+
+  <script src="script.js"></script>
+</body>
+</html>
