@@ -1,14 +1,16 @@
 /* global Tesseract, JSZip, saveAs */
 /* script.js — Tesseract.js v5 (browser)
+- origin chatgpt, edits cursor
    - Create worker with langs in arg #1 (v5 API)
    - NO load()/loadLanguage()/initialize() calls (deprecated)
    - Pass File/Blob directly to recognize() to avoid cloning/format issues
    - Use canvas only for cropping previews
 */
 
-  // ---- Cropping params ----
-const CROP_BOX_MARGIN = 2;     // px padding around Tesseract bbox
-const CROP_LUM_THR    = 220;   // 0..255; lower = tighter (more aggressive)
+  // ---- Cropping params (tunable here in code) ----
+const CROP_BOX_MARGIN   = 4;   // px padding around Tesseract bbox
+const CROP_LUM_THR      = 220; // 0..255; lower = tighter (more aggressive)
+const MIN_GLYPH_SIZE_PX = 8;   // minimum width/height of a glyph bbox to keep
 
 
 (() => {
@@ -152,6 +154,13 @@ function refineBoxByContent(ctx, region, thr /* 0..255 */) {
         // 3) Filter items
         const filtered = items
           .filter(it => it && it.bbox && (it.text ?? '').trim().length > 0)
+          // size sanity check to drop tiny / between-letters fragments
+          .filter(it => {
+            const { x0, y0, x1, y1 } = it.bbox;
+            const w = x1 - x0;
+            const h = y1 - y0;
+            return w >= MIN_GLYPH_SIZE_PX && h >= MIN_GLYPH_SIZE_PX;
+          })
           .filter(it => !onlyHebrew || hebrewRegex.test(it.text));
 
         // 4) TSV + metadata
@@ -191,7 +200,7 @@ function refineBoxByContent(ctx, region, thr /* 0..255 */) {
           // 1) start from Tesseract bbox
 let { x0, y0, x1, y1 } = it.bbox;
 
-// 2) pad
+// 2) pad using global margin
 let padded = expandBox({ x0, y0, x1, y1 }, CROP_BOX_MARGIN, imgW, imgH);
 
 // 3) tighten to ink (fallback to padded if none found)

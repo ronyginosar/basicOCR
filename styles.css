@@ -176,7 +176,6 @@ h2 {
 
 /* Range sliders to feel MD3 without JS */
 input[type="range"] {
-  -webkit-appearance: none;
   width: 160px; height: 24px;
   background: transparent; cursor: pointer;
 }
