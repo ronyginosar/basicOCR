@@ -156,6 +156,14 @@ h2 {
   color: var(--on-surface);
   border-color: var(--outline);
 }
+#dlCharZipBtn:disabled {
+  opacity: .5; filter: saturate(.6);
+}
+#dlCharZipBtn:not(:disabled) {
+  background: var(--accent);
+  color: var(--on-surface);
+  border-color: var(--outline);
+}
 .controls button:active { transform: translateY(1px); }
 
 /* Cards (thumbs) */

@@ -8,15 +8,17 @@
 */
 
   // ---- Cropping params (tunable here in code) ----
-const CROP_BOX_MARGIN   = 4;   // px padding around Tesseract bbox
-const CROP_LUM_THR      = 220; // 0..255; lower = tighter (more aggressive)
-const MIN_GLYPH_SIZE_PX = 8;   // minimum width/height of a glyph bbox to keep
+const CROP_BOX_MARGIN      = 4;   // px padding around Tesseract bbox (pre-refine)
+const POST_REFINE_PADDING  = 2;   // px padding after ink-tightening
+const CROP_LUM_THR         = 220; // 0..255; lower = tighter (more aggressive)
+const MIN_GLYPH_SIZE_PX    = 8;   // minimum width/height of a glyph bbox to keep
 
 
 (() => {
-  const fileInput   = document.getElementById('fileInput');
-  const runBtn      = document.getElementById('runBtn');
-  const dlZipBtn    = document.getElementById('dlZipBtn');
+  const fileInput    = document.getElementById('fileInput');
+  const runBtn       = document.getElementById('runBtn');
+  const dlZipBtn     = document.getElementById('dlZipBtn');
+  const dlCharZipBtn = document.getElementById('dlCharZipBtn');
   // const levelSel    = document.getElementById('level');
   const onlyHebrewC = document.getElementById('onlyHebrew');
   // const langPathInp = document.getElementById('langPath');
@@ -28,6 +30,7 @@ const MIN_GLYPH_SIZE_PX = 8;   // minimum width/height of a glyph bbox to keep
 
   const hebrewRegex = /[\u0590-\u05FF]/;
   let lastZipBlob = null;
+  let lastCharZipBlob = null;
 
   function log(msg) {
     logEl.textContent += msg + '\n';
@@ -37,7 +40,9 @@ const MIN_GLYPH_SIZE_PX = 8;   // minimum width/height of a glyph bbox to keep
     logEl.textContent = '';
     gallery.innerHTML = '';
     lastZipBlob = null;
+    lastCharZipBlob = null;
     dlZipBtn.disabled = true;
+    dlCharZipBtn.disabled = true;
   }
   function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
   function fmtConf(c) { return (typeof c === 'number' && isFinite(c)) ? c.toFixed(1) : String(c ?? ''); }
@@ -124,14 +129,33 @@ function refineBoxByContent(ctx, region, thr /* 0..255 */) {
     const lp = "https://tessdata.projectnaptha.com/4.0.0"; // hardcode for now
     const worker = await Tesseract.createWorker('heb', 1, lp ? { langPath: lp } : undefined);
 
-    const zip = new JSZip();
+    const zipByImage = new JSZip();
+    const zipByChar = new JSZip();
+    const charBuckets = new Map(); // key: char label -> { folder, safeLabel, entries: [] }
+      function getCharBucket(labelRaw) {
+        const key = (labelRaw && labelRaw.length) ? labelRaw : 'blank';
+        if (!charBuckets.has(key)) {
+          const safeLabel = safeTextForFilename(key);
+          const folderName = `char_${safeLabel}`;
+          charBuckets.set(key, {
+            label: key,
+            safeLabel,
+            folderName,
+            folder: zipByChar.folder(folderName),
+            entries: []
+          });
+        }
+        return charBuckets.get(key);
+      }
 
     try {
       // v5 workers are already loaded & initialized — do NOT call load/loadLanguage/initialize
 
       // Optional params (strings only)
+      // Limit recognition to Hebrew characters to reduce cross-script confusions.
       await worker.setParameters({
-        preserve_interword_spaces: '1'
+        preserve_interword_spaces: '1',
+        tessedit_char_whitelist: 'אבגדהוזחטיכלמנסעפצקרשתךםןףץ'
       });
 
       for (const file of files) {
@@ -165,6 +189,24 @@ function refineBoxByContent(ctx, region, thr /* 0..255 */) {
 
         // 4) TSV + metadata
         const tsv = toTSV(filtered, file.name, level);
+
+        // Per-glyph stats to help inspect confusion patterns.
+        const charStats = {};
+        for (const it of filtered) {
+          const txt = (it.text || '').trim();
+          if (!txt) continue;
+          const ch = txt; // glyph-level: expect a single character
+          if (!charStats[ch]) {
+            charStats[ch] = { count: 0, sumConf: 0, minConf: 100, maxConf: 0 };
+          }
+          const s = charStats[ch];
+          const c = typeof it.confidence === 'number' && isFinite(it.confidence) ? it.confidence : 0;
+          s.count += 1;
+          s.sumConf += c;
+          if (c < s.minConf) s.minConf = c;
+          if (c > s.maxConf) s.maxConf = c;
+        }
+
         const metadata = {
           source_image: file.name,
           level,
@@ -172,6 +214,13 @@ function refineBoxByContent(ctx, region, thr /* 0..255 */) {
           width: imgW,
           height: imgH,
           count: filtered.length,
+          stats_by_char: Object.entries(charStats).map(([ch, s]) => ({
+            char: ch,
+            count: s.count,
+            avg_conf: s.count ? s.sumConf / s.count : 0,
+            min_conf: s.minConf,
+            max_conf: s.maxConf
+          })),
           items: filtered.map((it, i) => ({
             index: i,
             text: it.text,
@@ -184,11 +233,12 @@ function refineBoxByContent(ctx, region, thr /* 0..255 */) {
             }
           }))
         };
-        zip.file(`${file.name}.tsv.txt`, tsv);
-        zip.file(`${file.name}.metadata.${level}.json`, JSON.stringify(metadata, null, 2));
+        zipByImage.file(`${file.name}.tsv.txt`, tsv);
+        zipByImage.file(`${file.name}.metadata.${level}.json`, JSON.stringify(metadata, null, 2));
 
         // 5) Crops → ZIP + gallery
-        const folder = zip.folder(`${file.name}_crops_${level}`);
+        const baseName = file.name.replace(/\s/g, '_');
+        const folder = zipByImage.folder(`${file.name}_crops_${level}`);
         for (let i = 0; i < filtered.length; i++) {
           const it = filtered[i];
           // const { x0, y0, x1, y1 } = it.bbox;
@@ -206,11 +256,14 @@ let padded = expandBox({ x0, y0, x1, y1 }, CROP_BOX_MARGIN, imgW, imgH);
 // 3) tighten to ink (fallback to padded if none found)
 let refined = refineBoxByContent(ctx, padded, CROP_LUM_THR) || padded;
 
-// 4) final integers + clamping
-const left = Math.max(0, refined.x0 | 0);
-const top  = Math.max(0, refined.y0 | 0);
-const w    = Math.max(1, (refined.x1 - refined.x0) | 0);
-const h    = Math.max(1, (refined.y1 - refined.y0) | 0);
+// 4) add post-refine padding to keep a ring around the ink
+let finalBox = expandBox(refined, POST_REFINE_PADDING, imgW, imgH);
+
+// 5) final integers + clamping
+const left = Math.max(0, finalBox.x0 | 0);
+const top  = Math.max(0, finalBox.y0 | 0);
+const w    = Math.max(1, (finalBox.x1 - finalBox.x0) | 0);
+const h    = Math.max(1, (finalBox.y1 - finalBox.y0) | 0);
 
 // (keep your existing drawImage to crop)
 
@@ -235,8 +288,24 @@ const h    = Math.max(1, (refined.y1 - refined.y0) | 0);
 
           // zip
           const u8 = dataURLToUint8(dataURL);
-          const fname = `${String(i).padStart(5,'0')}_${safeTextForFilename(it.text)}.png`;
+          // File naming: search "CROP_FILENAME" in code if you need to change format.
+const fname = `${baseName}_crops_${String(i).padStart(5,'0')}_${safeTextForFilename(it.text)}.png`;
           folder.file(fname, u8, { binary: true });
+          const charLabel = (it.text || '').trim();
+          const bucket = getCharBucket(charLabel);
+          bucket.folder.file(fname, u8, { binary: true });
+          bucket.entries.push({
+            source_image: file.name,
+            crop_filename: fname,
+            text: it.text,
+            confidence: it.confidence,
+            bbox: {
+              left: it.bbox.x0,
+              top: it.bbox.y0,
+              width: it.bbox.x1 - it.bbox.x0,
+              height: it.bbox.y1 - it.bbox.y0
+            }
+          });
         }
 
         log(`Crops: ${filtered.length}`);
@@ -249,16 +318,50 @@ const h    = Math.max(1, (refined.y1 - refined.y0) | 0);
       log('Worker terminated.');
     }
 
-    log('Building ZIP…');
-    lastZipBlob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    // Emit per-char TSV/JSON files inside each char folder
+    for (const bucket of charBuckets.values()) {
+      const header = 'idx\tsource_image\tcrop_filename\ttext\tconf\tleft\ttop\twidth\theight';
+      const rows = bucket.entries.map((entry, idx) => {
+        const { source_image, crop_filename, text, confidence, bbox } = entry;
+        return [
+          idx,
+          source_image,
+          crop_filename,
+          (text ?? '').replace(/\s/g, '␠'),
+          fmtConf(confidence),
+          bbox.left,
+          bbox.top,
+          bbox.width,
+          bbox.height
+        ].join('\t');
+      });
+      const tsvContent = [header, ...rows].join('\n');
+      bucket.folder.file(`${bucket.folderName}.tsv.txt`, tsvContent);
+
+      const metadata = {
+        char: bucket.label,
+        count: bucket.entries.length,
+        items: bucket.entries
+      };
+      bucket.folder.file(`${bucket.folderName}.metadata.json`, JSON.stringify(metadata, null, 2));
+    }
+
+    log('Building ZIPs…');
+    lastZipBlob = await zipByImage.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    lastCharZipBlob = await zipByChar.generateAsync({ type: 'blob', compression: 'DEFLATE' });
     dlZipBtn.disabled = false;
-    log('Ready. Click "Download ZIP".');
+    dlCharZipBtn.disabled = false;
+    log('Ready. Use the download buttons.');
   }
 
   runBtn.addEventListener('click', runOCR);
   dlZipBtn.addEventListener('click', () => {
     if (!lastZipBlob) return;
-    saveAs(lastZipBlob, 'ocr_crops_bundle.zip');
+    saveAs(lastZipBlob, 'ocr_crops_by_image.zip');
+  });
+  dlCharZipBtn.addEventListener('click', () => {
+    if (!lastCharZipBlob) return;
+    saveAs(lastCharZipBlob, 'ocr_crops_by_char.zip');
   });
 
   window.addEventListener('unhandledrejection', (e) => {
