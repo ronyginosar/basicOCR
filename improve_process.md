@@ -132,7 +132,154 @@
   - Build and iterate your **segmentation + UI + export** locally with open-source tools
   - Once the pipeline is solid, drop in **Cloud Vision as an optional recognizer**, used only when you really need its quality and are okay with sending images off-box
 
-## Next Steps
+## Implementation Plan & Execution
 
-Consider sketching a concrete Python pipeline (Tesseract + simple word detection + existing glyph-cropping logic) that mirrors the current JS UI but with better control over passes 1 and 2.
+### Decision: Python Backend with Two-Pass Tesseract
+
+Based on the discussion above, we decided to:
+1. Build a Python backend (FastAPI) running locally
+2. Implement two-pass Tesseract strategy (words → symbols)
+3. Implement full pipeline: Text Detection → Line/Word Normalization → Glyph Segmentation → Glyph Recognition
+4. Keep browser-based Tesseract.js as fallback option
+5. If results don't improve, consider combining Tesseract with other Python OCRs (EasyOCR/PaddleOCR)
+
+### What Was Built
+
+#### 1. Python Backend Structure (`backend/`)
+
+**Files Created:**
+- `requirements.txt`: FastAPI, uvicorn, pytesseract, opencv-python, pillow, numpy
+- `ocr_engine.py`: Core OCR engine with two-pass strategy
+- `api.py`: FastAPI endpoints for OCR processing
+- `README.md`: Setup and usage instructions
+
+**Key Features:**
+- **Two-Pass Tesseract:**
+  - **Pass 1**: Word/line detection using PSM 6 (uniform block) with Hebrew whitelist
+  - **Pass 2**: Symbol extraction from each word using PSM 10 (single character)
+- **Preprocessing Pipeline:**
+  - Grayscale conversion
+  - CLAHE (Contrast Limited Adaptive Histogram Equalization) for contrast enhancement
+  - Word region normalization (binarization via Otsu's method)
+- **Bounding Box Refinement:**
+  - Padding around Tesseract bbox (`CROP_BOX_MARGIN = 4px`)
+  - Ink-based tightening using luminance threshold (`CROP_LUM_THR = 220`)
+  - Post-refine padding (`POST_REFINE_PADDING = 2px`)
+  - Minimum glyph size filter (`MIN_GLYPH_SIZE_PX = 8px`)
+
+**API Endpoints:**
+- `POST /api/ocr/process`: Process single image, returns JSON with symbols, crops (base64), metadata
+- `POST /api/ocr/process-batch`: Process multiple images in batch
+
+#### 2. Frontend Integration
+
+**Changes to `index.html`:**
+- Added checkbox: "Use Python backend (two-pass Tesseract)"
+- Added backend URL input (default: `http://localhost:8001`)
+
+**Changes to `script.js`:**
+- Added `runOCRBackend()` function that calls the FastAPI backend
+- Modified `runOCR()` to check backend mode and route accordingly
+- Backend mode maintains same UI/UX: gallery, ZIP downloads (by image, by char), TSV/JSON exports
+
+**Dual Mode Support:**
+- **Browser Mode** (default): Uses Tesseract.js in browser (original implementation)
+- **Backend Mode**: Uses Python backend with two-pass Tesseract (new implementation)
+
+#### 3. Pipeline Implementation Details
+
+**Text Detection (Pass 1):**
+```python
+# PSM 6: Uniform block of text
+# Hebrew character whitelist applied
+words = pytesseract.image_to_data(image, lang='heb', psm=6, ...)
+```
+
+**Line/Word Normalization:**
+```python
+# For each word bbox:
+# 1. Extract region with padding
+# 2. Binarize using Otsu's threshold
+word_region = normalize_word_region(image, word_bbox)
+```
+
+**Glyph Segmentation (Pass 2):**
+```python
+# PSM 10: Single character
+# Run on normalized word region
+symbols = pytesseract.image_to_data(word_region, lang='heb', psm=10, ...)
+```
+
+**Glyph Recognition & Refinement:**
+```python
+# For each symbol:
+# 1. Expand bbox with margin
+# 2. Refine to ink content (luminance threshold)
+# 3. Add post-refine padding
+# 4. Extract crop image
+final_bbox = refine_and_pad(symbol_bbox)
+```
+
+### How to Use
+
+1. **Install Backend Dependencies:**
+```bash
+cd backend
+pip install -r requirements.txt
+```
+
+2. **Install Tesseract OCR:**
+   - macOS: `brew install tesseract tesseract-lang`
+   - Linux: `sudo apt-get install tesseract-ocr tesseract-ocr-heb`
+   - Windows: Download from GitHub
+
+3. **Start Backend Server:**
+```bash
+cd backend
+python api.py
+# Or: uvicorn api:app --reload --port 8001
+```
+
+4. **Use Frontend:**
+   - Open `index.html` in browser
+   - Check "Use Python backend (two-pass Tesseract)"
+   - Verify backend URL (default: `http://localhost:8001`)
+   - Select images and run OCR
+
+### Expected Improvements
+
+The two-pass strategy should help with:
+- **Better segmentation**: Constraining symbol detection to word regions reduces "between-letters" false positives
+- **More accurate glyph boxes**: Word-level normalization (binarization) before symbol extraction improves glyph isolation
+- **Reduced false detections**: Size filtering and Hebrew-only filtering at both passes
+
+### Next Steps if Results Don't Improve
+
+If the two-pass Tesseract approach doesn't show significant improvement:
+
+1. **Try EasyOCR as alternative recognizer:**
+   - Replace Tesseract symbol recognition with EasyOCR
+   - Keep Tesseract for word detection, or use EasyOCR's detector
+
+2. **Try PaddleOCR for detection:**
+   - Use PaddleOCR's text detector for word/line detection
+   - Use Tesseract or EasyOCR for glyph recognition
+
+3. **Hybrid approach:**
+   - Run multiple recognizers (Tesseract + EasyOCR) on same glyphs
+   - Ensemble results (confidence-weighted voting)
+
+4. **Custom segmentation:**
+   - Implement projection profile or connected components for glyph segmentation
+   - Use OCR only for recognition, not segmentation
+
+### Configuration
+
+All parameters are tunable in `backend/ocr_engine.py`:
+- `CROP_BOX_MARGIN`: Padding around Tesseract bbox (default: 4px)
+- `POST_REFINE_PADDING`: Padding after ink-tightening (default: 2px)
+- `CROP_LUM_THR`: Luminance threshold for ink detection (default: 220)
+- `MIN_GLYPH_SIZE_PX`: Minimum glyph size filter (default: 8px)
+- `psm_word`: Page segmentation mode for Pass 1 (default: 6)
+- `psm_symbol`: Page segmentation mode for Pass 2 (default: 10)
 

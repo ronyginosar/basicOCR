@@ -21,10 +21,18 @@ const MIN_GLYPH_SIZE_PX    = 8;   // minimum width/height of a glyph bbox to kee
   const dlCharZipBtn = document.getElementById('dlCharZipBtn');
   // const levelSel    = document.getElementById('level');
   const onlyHebrewC = document.getElementById('onlyHebrew');
+  const useBackendC  = document.getElementById('useBackend');
+  const backendUrlInp = document.getElementById('backendUrl');
+  const backendUrlLabel = document.getElementById('backendUrlLabel');
   // const langPathInp = document.getElementById('langPath');
   const logEl       = document.getElementById('log');
   const gallery     = document.getElementById('gallery');
   const workCanvas  = document.getElementById('workCanvas');
+
+  // Show/hide backend URL input
+  useBackendC.addEventListener('change', () => {
+    backendUrlLabel.style.display = useBackendC.checked ? 'flex' : 'none';
+  });
 
 
 
@@ -113,7 +121,189 @@ function refineBoxByContent(ctx, region, thr /* 0..255 */) {
     });
   }
 
+  // Backend API call function
+  async function runOCRBackend() {
+    clearUI();
+    const files = Array.from(fileInput.files || []);
+    if (!files.length) { log('No files selected.'); return; }
+
+    const onlyHebrew = !!onlyHebrewC.checked;
+    const backendUrl = (backendUrlInp.value || 'http://localhost:8001').trim().replace(/\/$/, '');
+
+    const zipByImage = new JSZip();
+    const zipByChar = new JSZip();
+    const charBuckets = new Map();
+
+    function getCharBucket(labelRaw) {
+      const key = (labelRaw && labelRaw.length) ? labelRaw : 'blank';
+      if (!charBuckets.has(key)) {
+        const safeLabel = safeTextForFilename(key);
+        const folderName = `char_${safeLabel}`;
+        charBuckets.set(key, {
+          label: key,
+          safeLabel,
+          folderName,
+          folder: zipByChar.folder(folderName),
+          entries: []
+        });
+      }
+      return charBuckets.get(key);
+    }
+
+    try {
+      for (const file of files) {
+        log(`\n=== ${file.name} ===`);
+
+        // Call backend API
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('only_hebrew', onlyHebrew);
+
+        log('Sending to backend...');
+        const response = await fetch(`${backendUrl}/api/ocr/process`, {
+          method: 'POST',
+          body: formData
+        });
+
+        if (!response.ok) {
+          throw new Error(`Backend error: ${response.status} ${response.statusText}`);
+        }
+
+        const result = await response.json();
+
+        // Load original image for gallery
+        const img = await loadHTMLImageFromFile(file);
+        const imgW = result.width;
+        const imgH = result.height;
+
+        // Convert backend symbols to frontend format
+        const filtered = result.symbols.map(sym => ({
+          text: sym.text,
+          confidence: sym.confidence,
+          bbox: {
+            x0: sym.bbox.left,
+            y0: sym.bbox.top,
+            x1: sym.bbox.left + sym.bbox.width,
+            y1: sym.bbox.top + sym.bbox.height
+          }
+        }));
+
+        // TSV + metadata
+        const tsv = toTSV(filtered, file.name, 'symbols');
+        const metadata = {
+          source_image: file.name,
+          level: 'symbols',
+          onlyHebrew,
+          width: imgW,
+          height: imgH,
+          count: filtered.length,
+          stats_by_char: result.stats_by_char,
+          items: filtered.map((it, i) => ({
+            index: i,
+            text: it.text,
+            confidence: it.confidence,
+            bbox: {
+              left: it.bbox.x0,
+              top: it.bbox.y0,
+              width: it.bbox.x1 - it.bbox.x0,
+              height: it.bbox.y1 - it.bbox.y0
+            }
+          }))
+        };
+        zipByImage.file(`${file.name}.tsv.txt`, tsv);
+        zipByImage.file(`${file.name}.metadata.symbols.json`, JSON.stringify(metadata, null, 2));
+
+        // Crops from backend (base64)
+        const baseName = file.name.replace(/\s/g, '_');
+        const folder = zipByImage.folder(`${file.name}_crops_symbols`);
+
+        for (let i = 0; i < result.crops.length; i++) {
+          const crop = result.crops[i];
+          const it = filtered[i];
+
+          // Convert base64 to blob for ZIP
+          const base64Data = crop.image_data.split(',')[1];
+          const bin = atob(base64Data);
+          const u8 = new Uint8Array(bin.length);
+          for (let j = 0; j < bin.length; j++) u8[j] = bin.charCodeAt(j);
+
+          // Gallery
+          const card = document.createElement('div');
+          card.className = 'thumb';
+          const preview = new Image();
+          preview.src = crop.image_data;
+          const metaDiv = document.createElement('div');
+          metaDiv.className = 'meta';
+          metaDiv.textContent = `#${String(i).padStart(4,'0')} | symbols | ${(it.text || '').replace(/\s/g,'␠')} | conf=${fmtConf(it.confidence)}`;
+          card.appendChild(preview);
+          card.appendChild(metaDiv);
+          gallery.appendChild(card);
+
+          // ZIP
+          const fname = `${baseName}_crops_${String(i).padStart(5,'0')}_${safeTextForFilename(it.text)}.png`;
+          folder.file(fname, u8, { binary: true });
+
+          const charLabel = (it.text || '').trim();
+          const bucket = getCharBucket(charLabel);
+          bucket.folder.file(fname, u8, { binary: true });
+          bucket.entries.push({
+            source_image: file.name,
+            crop_filename: fname,
+            text: it.text,
+            confidence: it.confidence,
+            bbox: {
+              left: it.bbox.x0,
+              top: it.bbox.y0,
+              width: it.bbox.x1 - it.bbox.x0,
+              height: it.bbox.y1 - it.bbox.y0
+            }
+          });
+        }
+
+        log(`Crops: ${filtered.length}`);
+      }
+
+      // Per-char TSV/JSON
+      for (const bucket of charBuckets.values()) {
+        const header = 'idx\tsource_image\tcrop_filename\ttext\tconf\tleft\ttop\twidth\theight';
+        const rows = bucket.entries.map((entry, idx) => {
+          const { source_image, crop_filename, text, confidence, bbox } = entry;
+          return [
+            idx, source_image, crop_filename, (text ?? '').replace(/\s/g, '␠'),
+            fmtConf(confidence), bbox.left, bbox.top, bbox.width, bbox.height
+          ].join('\t');
+        });
+        const tsvContent = [header, ...rows].join('\n');
+        bucket.folder.file(`${bucket.folderName}.tsv.txt`, tsvContent);
+
+        const metadata = {
+          char: bucket.label,
+          count: bucket.entries.length,
+          items: bucket.entries
+        };
+        bucket.folder.file(`${bucket.folderName}.metadata.json`, JSON.stringify(metadata, null, 2));
+      }
+
+      log('Building ZIPs…');
+      lastZipBlob = await zipByImage.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      lastCharZipBlob = await zipByChar.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      dlZipBtn.disabled = false;
+      dlCharZipBtn.disabled = false;
+      log('Ready. Use the download buttons.');
+
+    } catch (err) {
+      console.error(err);
+      log('ERROR: ' + (err && err.message ? err.message : String(err)));
+      log('Make sure the backend is running at ' + backendUrl);
+    }
+  }
+
   async function runOCR() {
+    // Check if backend mode is enabled
+    if (useBackendC.checked) {
+      return runOCRBackend();
+    }
+
     clearUI();
 
     const files = Array.from(fileInput.files || []);

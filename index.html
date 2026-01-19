@@ -39,9 +39,19 @@
       Keep only Hebrew chars (U+0590–U+05FF)
     </label>
 
+    <label>
+      <input id="useBackend" type="checkbox" />
+      Use Python backend (two-pass Tesseract)
+    </label>
+
+    <label id="backendUrlLabel" style="display:none;">
+      Backend URL:
+      <input id="backendUrl" type="text" size="30" value="http://localhost:8001" />
+    </label>
+
     <!-- restore if we want to:
       offline deployments (no CDN): you host your own tessdata/heb.traineddata and point to ./tessdata.
-      custom training: you’ve trained a specialized Hebrew model and want to load it instead of the default one.
+      custom training: you've trained a specialized Hebrew model and want to load it instead of the default one.
       network-restricted environments (some institutions block CDN calls). -->
     <!-- <label>
       Tessdata URL:
