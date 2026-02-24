@@ -156,17 +156,19 @@ function refineBoxByContent(ctx, region, thr /* 0..255 */) {
 
         // Call backend API
         const formData = new FormData();
-        formData.append('file', file);
+        formData.append('file', file, file.name);  // Explicitly set filename
         formData.append('only_hebrew', onlyHebrew);
 
-        log('Sending to backend...');
+        log(`Sending to backend: ${file.name} (${file.type || 'unknown type'})...`);
         const response = await fetch(`${backendUrl}/api/ocr/process`, {
           method: 'POST',
           body: formData
         });
 
         if (!response.ok) {
-          throw new Error(`Backend error: ${response.status} ${response.statusText}`);
+          const errorData = await response.json().catch(() => ({ detail: response.statusText }));
+          const errorMsg = errorData.detail || errorData.error || `${response.status} ${response.statusText}`;
+          throw new Error(`Backend error: ${errorMsg}`);
         }
 
         const result = await response.json();

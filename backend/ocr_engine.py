@@ -124,20 +124,102 @@ class HebrewOCREngine:
             if not text or conf < 0:
                 continue
             
-            # Extract bounding box
-            x = data['left'][i]
-            y = data['top'][i]
-            w = data['width'][i]
-            h = data['height'][i]
+            # Extract bounding box (convert to native Python int)
+            x = int(data['left'][i])
+            y = int(data['top'][i])
+            w = int(data['width'][i])
+            h = int(data['height'][i])
             
             words.append({
                 'text': text,
-                'confidence': conf,
-                'bbox': (x, y, x + w, y + h),  # (x0, y0, x1, y1)
+                'confidence': float(conf),  # Ensure float, not numpy float
+                'bbox': (x, y, x + w, y + h),  # (x0, y0, x1, y1) - all ints
                 'level': 'word'
             })
         
         return words
+    
+    def pass1_extract_symbols_direct(self, image: np.ndarray) -> List[Dict]:
+        """
+        Extract symbols directly from full image (like browser Tesseract.js approach)
+        This is the primary method for getting individual characters
+        """
+        pil_image = Image.fromarray(image)
+        
+        # Get symbol-level data directly from full image
+        # Use PSM 6 (uniform block) with symbol-level output
+        data = pytesseract.image_to_data(
+            pil_image,
+            lang=self.lang,
+            config=f'--psm 6 -c tessedit_char_whitelist=אבגדהוזחטסעפצקרשתךםןףץ',
+            output_type=pytesseract.Output.DICT
+        )
+        
+        symbols = []
+        n_boxes = len(data['text'])
+        
+        # Debug: count by level
+        level_counts = {}
+        for i in range(n_boxes):
+            level = int(data['level'][i])
+            level_counts[level] = level_counts.get(level, 0) + 1
+        print(f"Tesseract returned {n_boxes} boxes: level distribution {level_counts}")
+        
+        for i in range(n_boxes):
+            text = data['text'][i].strip()
+            conf = float(data['conf'][i])
+            level = int(data['level'][i])
+            
+            # Extract bounding box
+            x = int(data['left'][i])
+            y = int(data['top'][i])
+            w = int(data['width'][i])
+            h = int(data['height'][i])
+            
+            # Debug first few level 4 and 5 boxes
+            if level in [4, 5] and len(symbols) < 10:
+                print(f"  Level {level}: text='{text}' conf={conf} bbox=({x},{y},{x+w},{y+h}) size={w}x{h}")
+            
+            # Skip empty or low-confidence detections
+            if not text or conf < 0:
+                if level in [4, 5]:
+                    print(f"  Skipped level {level} box {i}: empty text or low conf")
+                continue
+            
+            # Size filter
+            if w < self.MIN_GLYPH_SIZE_PX or h < self.MIN_GLYPH_SIZE_PX:
+                if level in [4, 5]:
+                    print(f"  Skipped level {level} box {i}: too small ({w}x{h} < {self.MIN_GLYPH_SIZE_PX})")
+                continue
+            
+            # Process based on level
+            if level == 5:
+                # Symbol-level: accept single characters
+                if len(text) == 1:
+                    symbols.append({
+                        'text': text,
+                        'confidence': float(conf),
+                        'bbox': (x, y, x + w, y + h),
+                        'level': 'symbol'
+                    })
+                else:
+                    print(f"  Skipped level 5 box: text length {len(text)} (not single char): '{text}'")
+            elif level == 4:
+                # Word-level: split into individual characters
+                if len(text) > 0:
+                    char_width = w / len(text) if len(text) > 0 else w
+                    for char_idx, char in enumerate(text):
+                        char_x = int(x + char_idx * char_width)
+                        char_w = int(char_width)
+                        symbols.append({
+                            'text': char,
+                            'confidence': float(conf),
+                            'bbox': (char_x, y, char_x + char_w, y + h),
+                            'level': 'symbol'
+                        })
+        
+        print(f"Extracted {len(symbols)} symbols from Tesseract data")
+        return symbols
     
     def pass2_extract_symbols(self, image: np.ndarray, word_bbox: Tuple[int, int, int, int]) -> List[Dict]:
         """
@@ -152,6 +234,10 @@ class HebrewOCREngine:
         """
         # Normalize the word region
         word_region = self.normalize_word_region(image, word_bbox)
+        
+        # Check if word region is too small
+        if word_region.shape[0] < 10 or word_region.shape[1] < 10:
+            return []
         
         # Convert to PIL Image
         pil_word = Image.fromarray(word_region)
@@ -173,31 +259,43 @@ class HebrewOCREngine:
         for i in range(n_boxes):
             text = data['text'][i].strip()
             conf = float(data['conf'][i])
+            level = int(data['level'][i])  # 5 = symbol, 4 = word, etc.
+            
+            # Only process symbol-level detections (level 5)
+            # Skip word-level or higher (we want individual characters)
+            if level != 5:
+                continue
             
             # Skip empty or low-confidence detections
             if not text or conf < 0:
                 continue
             
             # Extract bounding box (relative to word region)
-            x_rel = data['left'][i]
-            y_rel = data['top'][i]
-            w = data['width'][i]
-            h = data['height'][i]
+            x_rel = int(data['left'][i])
+            y_rel = int(data['top'][i])
+            w = int(data['width'][i])
+            h = int(data['height'][i])
             
             # Convert to absolute coordinates
-            x0 = x0_word + x_rel
-            y0 = y0_word + y_rel
-            x1 = x0 + w
-            y1 = y0 + h
+            x0 = int(x0_word + x_rel)
+            y0 = int(y0_word + y_rel)
+            x1 = int(x0 + w)
+            y1 = int(y0 + h)
             
             # Size filter
             if w < self.MIN_GLYPH_SIZE_PX or h < self.MIN_GLYPH_SIZE_PX:
                 continue
             
+            # Only add if text is a single character (or very short)
+            # Tesseract sometimes groups characters, so filter those out
+            if len(text) > 1:
+                # If it's multiple characters, skip it (we want individual glyphs)
+                continue
+            
             symbols.append({
                 'text': text,
-                'confidence': conf,
-                'bbox': (x0, y0, x1, y1),  # Absolute coordinates
+                'confidence': float(conf),  # Ensure float, not numpy float
+                'bbox': (x0, y0, x1, y1),  # Absolute coordinates (all ints)
                 'level': 'symbol'
             })
         
@@ -239,16 +337,17 @@ class HebrewOCREngine:
         y_min, y_max = np.where(rows)[0][[0, -1]]
         x_min, x_max = np.where(cols)[0][[0, -1]]
         
-        return (x0 + x_min, y0 + y_min, x0 + x_max + 1, y0 + y_max + 1)
+        # Convert numpy int64 to native Python int
+        return (int(x0 + x_min), int(y0 + y_min), int(x0 + x_max + 1), int(y0 + y_max + 1))
     
     def expand_box(self, bbox: Tuple[int, int, int, int], margin: int, max_w: int, max_h: int) -> Tuple[int, int, int, int]:
         """Expand bounding box by margin, clamped to image bounds"""
         x0, y0, x1, y1 = bbox
         return (
-            max(0, x0 - margin),
-            max(0, y0 - margin),
-            min(max_w, x1 + margin),
-            min(max_h, y1 + margin)
+            int(max(0, x0 - margin)),
+            int(max(0, y0 - margin)),
+            int(min(max_w, x1 + margin)),
+            int(min(max_h, y1 + margin))
         )
     
     def process_image(self, image_path: str, only_hebrew: bool = True) -> Dict:
@@ -270,19 +369,20 @@ class HebrewOCREngine:
         img_preprocessed = self.preprocess_image(img_bgr)
         img_h, img_w = img_preprocessed.shape[:2]
         
-        # Pass 1: Detect words/lines
-        words = self.pass1_detect_words_lines(img_preprocessed)
+        # Primary method: Extract symbols directly from full image (like browser version)
+        # This is more reliable for getting individual characters
+        all_symbols = self.pass1_extract_symbols_direct(img_preprocessed)
+        print(f"Direct symbol extraction found {len(all_symbols)} symbols")
         
-        # Pass 2: Extract symbols from each word
-        all_symbols = []
-        for word in words:
-            word_bbox = word['bbox']
-            symbols = self.pass2_extract_symbols(img_preprocessed, word_bbox)
-            all_symbols.extend(symbols)
+        # Optional: Also detect words for reference (not used for symbol extraction)
+        words = self.pass1_detect_words_lines(img_preprocessed)
+        print(f"Pass 1 (reference) found {len(words)} words/lines")
         
         # Filter Hebrew if requested
         if only_hebrew:
+            before = len(all_symbols)
             all_symbols = [s for s in all_symbols if self.HEBREW_REGEX.search(s['text'])]
+            print(f"After Hebrew filter: {len(all_symbols)}/{before} symbols")
         
         # Refine bounding boxes and prepare final crops
         refined_symbols = []
@@ -308,10 +408,11 @@ class HebrewOCREngine:
                 img_h
             )
             
+            # Ensure bbox is a tuple, not dict
             refined_symbols.append({
                 'text': sym['text'],
                 'confidence': sym['confidence'],
-                'bbox': final_bbox,
+                'bbox': final_bbox,  # Tuple (x0, y0, x1, y1)
                 'bbox_original': sym['bbox']
             })
         
@@ -335,18 +436,18 @@ class HebrewOCREngine:
         
         return {
             'source_image': image_path,
-            'width': img_w,
-            'height': img_h,
+            'width': int(img_w),
+            'height': int(img_h),
             'count': len(refined_symbols),
             'words': words,
             'symbols': refined_symbols,
             'stats_by_char': [
                 {
                     'char': ch,
-                    'count': s['count'],
-                    'avg_conf': s['sum_conf'] / s['count'],
-                    'min_conf': s['min_conf'],
-                    'max_conf': s['max_conf']
+                    'count': int(s['count']),
+                    'avg_conf': float(s['sum_conf'] / s['count']),
+                    'min_conf': float(s['min_conf']),
+                    'max_conf': float(s['max_conf'])
                 }
                 for ch, s in char_stats.items()
             ]
