@@ -147,139 +147,147 @@ Based on the discussion above, we decided to:
 
 #### 1. Python Backend Structure (`backend/`)
 
-**Files Created:**
-- `requirements.txt`: FastAPI, uvicorn, pytesseract, opencv-python, pillow, numpy
-- `ocr_engine.py`: Core OCR engine with two-pass strategy
+**Files:**
+- `requirements.txt`: FastAPI, uvicorn, pytesseract, opencv-python, pillow, numpy (+ optional easyocr)
+- `ocr_engine.py`: Multi-strategy OCR engine
 - `api.py`: FastAPI endpoints for OCR processing
 - `README.md`: Setup and usage instructions
 
-**Key Features:**
-- **Two-Pass Tesseract:**
-  - **Pass 1**: Word/line detection using PSM 6 (uniform block) with Hebrew whitelist
-  - **Pass 2**: Symbol extraction from each word using PSM 10 (single character)
-- **Preprocessing Pipeline:**
-  - Grayscale conversion
-  - CLAHE (Contrast Limited Adaptive Histogram Equalization) for contrast enhancement
-  - Word region normalization (binarization via Otsu's method)
-- **Bounding Box Refinement:**
-  - Padding around Tesseract bbox (`CROP_BOX_MARGIN = 4px`)
-  - Ink-based tightening using luminance threshold (`CROP_LUM_THR = 220`)
-  - Post-refine padding (`POST_REFINE_PADDING = 2px`)
-  - Minimum glyph size filter (`MIN_GLYPH_SIZE_PX = 8px`)
+**Key Discovery — Why Single-Pass Failed:**
+Tesseract's `image_to_data` with PSM 6 returns Hebrew words as single "symbol" entries at level 5 (e.g., `text='אבגדהוזחט'` with `conf=0.0`). It does NOT segment individual Hebrew characters. The 0.0 confidence is Tesseract honestly saying "I recognized this text but couldn't isolate individual characters."
+
+**Fix — Multi-Strategy Pipeline:**
+The engine now tries three strategies in order until one succeeds:
+
+**Strategy 1 — `image_to_boxes` on full image (fast path):**
+- `pytesseract.image_to_boxes()` uses Tesseract's box-file mode which often returns per-character bounding boxes even when `image_to_data` groups them
+- If this produces ≥2 Hebrew chars, we use these results directly
+
+**Strategy 2 — Two-pass (word regions → per-region extraction):**
+- **Pass 1**: `image_to_data` PSM 6 → word bounding boxes (level 4) + reference text (level 5)
+- **Pass 2a**: `image_to_boxes` PSM 7 (single text line) on each word region → per-char boxes
+- **Pass 2b** (fallback): Connected-components segmentation + reference text matching or PSM 10
+  - Finds individual ink blobs via `cv2.connectedComponentsWithStats`
+  - Merges small components (dots, dagesh, niqqud) into nearest large neighbor
+  - If CC count matches reference text length → assigns characters 1:1 (RTL order)
+  - Otherwise → runs PSM 10 (single character) on each component
+
+**Strategy 3 — Full-image connected components (last resort):**
+- If no word regions found, runs CC + PSM 10 on the entire image
+
+**Optional — EasyOCR cross-reference:**
+- If installed, reads word regions with EasyOCR for better reference text
+- Helps improve 1:1 matching in the CC strategy
+
+**Also Fixed:**
+- Hebrew whitelist was missing 5 letters (יכלמנ) — now includes all 27 (22 base + 5 final forms)
+- All coordinates guaranteed native Python int (no numpy int64 JSON errors)
+- Clear strategy-by-strategy logging for debugging
+
+**Preprocessing Pipeline:**
+- Grayscale conversion
+- CLAHE contrast enhancement
+- Otsu binarization for word regions
+
+**Bounding Box Refinement:**
+- Padding around detected bbox (`CROP_BOX_MARGIN = 4px`)
+- Ink-based tightening using luminance threshold (`CROP_LUM_THR = 220`)
+- Post-refine padding (`POST_REFINE_PADDING = 2px`)
+- Minimum glyph size filter (`MIN_GLYPH_SIZE_PX = 8px`)
+- Overlap deduplication (`OVERLAP_THRESHOLD = 0.45`)
 
 **API Endpoints:**
-- `POST /api/ocr/process`: Process single image, returns JSON with symbols, crops (base64), metadata
+- `POST /api/ocr/process`: Process single image → JSON with symbols, crops (base64), metadata
 - `POST /api/ocr/process-batch`: Process multiple images in batch
 
 #### 2. Frontend Integration
 
 **Changes to `index.html`:**
-- Added checkbox: "Use Python backend (two-pass Tesseract)"
-- Added backend URL input (default: `http://localhost:8001`)
+- Checkbox: "Use Python backend (two-pass Tesseract)"
+- Backend URL input (default: `http://localhost:8001`)
 
 **Changes to `script.js`:**
-- Added `runOCRBackend()` function that calls the FastAPI backend
-- Modified `runOCR()` to check backend mode and route accordingly
+- `runOCRBackend()` function calls the FastAPI backend
+- `runOCR()` routes to backend or browser mode
 - Backend mode maintains same UI/UX: gallery, ZIP downloads (by image, by char), TSV/JSON exports
 
 **Dual Mode Support:**
-- **Browser Mode** (default): Uses Tesseract.js in browser (original implementation)
-- **Backend Mode**: Uses Python backend with two-pass Tesseract (new implementation)
+- **Browser Mode** (default): Tesseract.js in browser (original)
+- **Backend Mode**: Python multi-strategy engine (recommended)
 
-#### 3. Pipeline Implementation Details
+#### 3. Pipeline Flow
 
-**Text Detection (Pass 1):**
-```python
-# PSM 6: Uniform block of text
-# Hebrew character whitelist applied
-words = pytesseract.image_to_data(image, lang='heb', psm=6, ...)
 ```
-
-**Line/Word Normalization:**
-```python
-# For each word bbox:
-# 1. Extract region with padding
-# 2. Binarize using Otsu's threshold
-word_region = normalize_word_region(image, word_bbox)
-```
-
-**Glyph Segmentation (Pass 2):**
-```python
-# PSM 10: Single character
-# Run on normalized word region
-symbols = pytesseract.image_to_data(word_region, lang='heb', psm=10, ...)
-```
-
-**Glyph Recognition & Refinement:**
-```python
-# For each symbol:
-# 1. Expand bbox with margin
-# 2. Refine to ink content (luminance threshold)
-# 3. Add post-refine padding
-# 4. Extract crop image
-final_bbox = refine_and_pad(symbol_bbox)
+Full Image
+    │
+    ├─ Strategy 1: image_to_boxes PSM 6
+    │   └─ Returns per-char boxes? ──yes──→ Done ✓
+    │                                no ↓
+    ├─ Strategy 2: Two-Pass
+    │   ├─ Pass 1: image_to_data PSM 6 → word regions + ref text
+    │   │
+    │   └─ For each word region:
+    │       ├─ Pass 2a: image_to_boxes PSM 7 → per-char boxes?
+    │       │   └─ yes → use these ✓
+    │       │
+    │       └─ Pass 2b: Connected Components
+    │           ├─ Find ink blobs (merge dots into parents)
+    │           ├─ CC count == ref text length? → assign 1:1 ✓
+    │           └─ else → PSM 10 per blob ✓
+    │
+    └─ Strategy 3: CC on full image (last resort)
 ```
 
 ### How to Use
 
-1. **Install Backend Dependencies:**
-```bash
-cd backend
-pip install -r requirements.txt
-```
-
-2. **Install Tesseract OCR:**
+1. **Install Tesseract OCR:**
    - macOS: `brew install tesseract tesseract-lang`
    - Linux: `sudo apt-get install tesseract-ocr tesseract-ocr-heb`
-   - Windows: Download from GitHub
+
+2. **Install Backend Dependencies (conda recommended):**
+```bash
+conda create -n hebrew-ocr python=3.9
+conda activate hebrew-ocr
+conda install -c conda-forge fastapi uvicorn pillow numpy opencv
+pip install pytesseract python-multipart
+# Optional for EasyOCR cross-reference:
+# pip install easyocr
+```
 
 3. **Start Backend Server:**
 ```bash
 cd backend
 python api.py
-# Or: uvicorn api:app --reload --port 8001
 ```
 
 4. **Use Frontend:**
    - Open `index.html` in browser
-   - Check "Use Python backend (two-pass Tesseract)"
+   - Check "Use Python backend"
    - Verify backend URL (default: `http://localhost:8001`)
    - Select images and run OCR
 
-### Expected Improvements
+### Configuration
 
-The two-pass strategy should help with:
-- **Better segmentation**: Constraining symbol detection to word regions reduces "between-letters" false positives
-- **More accurate glyph boxes**: Word-level normalization (binarization) before symbol extraction improves glyph isolation
-- **Reduced false detections**: Size filtering and Hebrew-only filtering at both passes
+All parameters are tunable at the top of `backend/ocr_engine.py`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `CROP_BOX_MARGIN` | 4 | px padding around detected bbox |
+| `POST_REFINE_PADDING` | 2 | px padding after ink-tightening |
+| `CROP_LUM_THR` | 220 | Luminance threshold for ink detection (0–255) |
+| `MIN_GLYPH_SIZE_PX` | 8 | Minimum glyph bbox width/height |
+| `MIN_COMPONENT_AREA` | 40 | Minimum CC pixel area |
+| `WORD_REGION_PADDING` | 6 | px padding when cropping word regions |
+| `CONFIDENCE_FLOOR` | 40.0 | Default confidence when Tesseract returns 0 |
+| `CC_SMALL_RATIO` | 0.20 | CCs below this fraction of median area → "dot" |
+| `CC_MERGE_DISTANCE_X` | 20 | Max horizontal distance to merge dot into letter |
+| `CC_MERGE_DISTANCE_Y` | 35 | Max vertical distance to merge dot into letter |
+| `OVERLAP_THRESHOLD` | 0.45 | IoU threshold for deduplication |
 
 ### Next Steps if Results Don't Improve
 
-If the two-pass Tesseract approach doesn't show significant improvement:
-
-1. **Try EasyOCR as alternative recognizer:**
-   - Replace Tesseract symbol recognition with EasyOCR
-   - Keep Tesseract for word detection, or use EasyOCR's detector
-
-2. **Try PaddleOCR for detection:**
-   - Use PaddleOCR's text detector for word/line detection
-   - Use Tesseract or EasyOCR for glyph recognition
-
-3. **Hybrid approach:**
-   - Run multiple recognizers (Tesseract + EasyOCR) on same glyphs
-   - Ensemble results (confidence-weighted voting)
-
-4. **Custom segmentation:**
-   - Implement projection profile or connected components for glyph segmentation
-   - Use OCR only for recognition, not segmentation
-
-### Configuration
-
-All parameters are tunable in `backend/ocr_engine.py`:
-- `CROP_BOX_MARGIN`: Padding around Tesseract bbox (default: 4px)
-- `POST_REFINE_PADDING`: Padding after ink-tightening (default: 2px)
-- `CROP_LUM_THR`: Luminance threshold for ink detection (default: 220)
-- `MIN_GLYPH_SIZE_PX`: Minimum glyph size filter (default: 8px)
-- `psm_word`: Page segmentation mode for Pass 1 (default: 6)
-- `psm_symbol`: Page segmentation mode for Pass 2 (default: 10)
+1. **Enable EasyOCR**: Uncomment in `requirements.txt`, set `use_easyocr=True` in `api.py` — provides better reference text for CC matching
+2. **Try PaddleOCR** for text detection (better word/line boxes)
+3. **Vertical projection profiles** for glyph segmentation within word regions (handles touching letters)
+4. **Google Cloud Vision** as optional recognizer (best quality, paid API)
 
