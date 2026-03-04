@@ -1,6 +1,12 @@
 """
 Hebrew OCR Engine — Multi-strategy glyph extraction
 ====================================================
+PSM = Page Segmentation Mode — tells Tesseract how to interpret the image layout.
+Key modes used here:
+  PSM 6  – Assume a single uniform block of text (good for detecting words/lines)
+  PSM 7  – Treat the image as a single text line (good for per-char extraction in a word)
+  PSM 10 – Treat the image as a single character (good for recognizing one glyph)
+
 Pipeline (tries strategies in order until one succeeds):
   Strategy 1 – image_to_boxes PSM 6 on full image (fast path)
   Strategy 2 – Two-pass:
@@ -29,17 +35,17 @@ CROP_LUM_THR = 220             # 0..255 luminance threshold for ink detection
 MIN_GLYPH_SIZE_PX = 8          # minimum width/height to keep a glyph bbox
 MIN_COMPONENT_AREA = 40        # minimum pixel area for a connected component
 WORD_REGION_PADDING = 6        # px padding when cropping word regions for Pass 2
-CONFIDENCE_FLOOR = 40.0        # default confidence when Tesseract returns 0 or negative
+CONFIDENCE_UNSCORED = -1.0     # sentinel: "no real confidence available" (displayed as N/A)
+MIN_CHAR_CONFIDENCE = 15.0     # drop chars with real confidence below this (reduces noise)
 CC_SMALL_RATIO = 0.20          # CCs smaller than this fraction of median → "dot/niqqud"
 CC_MERGE_DISTANCE_X = 20       # max horizontal px to merge a small CC into a large one
 CC_MERGE_DISTANCE_Y = 35       # max vertical px to merge a small CC into a large one
 MIN_CHARS_FOR_STRATEGY = 2     # minimum chars for a strategy to be accepted
 OVERLAP_THRESHOLD = 0.45       # IoU threshold for deduplication
 
-TESSERACT_LANG = 'heb'
-
-# Full Hebrew alphabet: 22 base + 5 final forms (was missing יכלמנ before)
-HEBREW_WHITELIST = 'אבגדהוזחטיכלמנסעפצקרשתךםןףץ'
+TESSERACT_LANG = 'heb'         # Use 'heb+eng' if you have eng traineddata for better script separation
+ENABLE_THINNING = False        # Set True for heavy/bold fonts — morphological erosion thins strokes
+THINNING_KERNEL_SIZE = 2       # Erosion kernel size (larger = more thinning, try 2–3)
 
 # Hebrew Unicode detection
 HEBREW_RANGE = '\u0590-\u05FF'
@@ -73,10 +79,18 @@ class HebrewOCREngine:
     # ──────────────────────────────────────────────────
 
     def preprocess(self, image: np.ndarray) -> np.ndarray:
-        """Grayscale + CLAHE contrast enhancement."""
+        """Grayscale + CLAHE contrast enhancement + optional thinning for heavy fonts."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image.copy()
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        return clahe.apply(gray)
+        enhanced = clahe.apply(gray)
+        if ENABLE_THINNING:
+            enhanced = self._thin_heavy_strokes(enhanced)
+        return enhanced
+
+    def _thin_heavy_strokes(self, gray: np.ndarray) -> np.ndarray:
+        """Morphological dilation on grayscale = erodes dark strokes → thins heavy/bold fonts."""
+        kernel = np.ones((THINNING_KERNEL_SIZE, THINNING_KERNEL_SIZE), np.uint8)
+        return cv2.dilate(gray, kernel, iterations=1)
 
     def binarize(self, gray: np.ndarray) -> np.ndarray:
         """Otsu binarization → black text on white background."""
@@ -99,13 +113,18 @@ class HebrewOCREngine:
             boxes_str = pytesseract.image_to_boxes(
                 pil_image,
                 lang=TESSERACT_LANG,
-                config=f'--psm 6 -c tessedit_char_whitelist={HEBREW_WHITELIST}'
+                config='--psm 6'
             )
         except Exception as e:
             print(f"[S1] image_to_boxes failed: {e}")
             return []
 
         symbols = self._parse_boxes_string(boxes_str, img_h, offset=(0, 0))
+
+        # Score each character with real Tesseract confidence via PSM 10
+        for sym in symbols:
+            sym['confidence'] = self._score_char_confidence(image, sym['bbox'])
+
         print(f"[S1] Full-image boxes → {len(symbols)} chars")
         return symbols
 
@@ -145,7 +164,7 @@ class HebrewOCREngine:
 
             symbols.append({
                 'text': char,
-                'confidence': CONFIDENCE_FLOOR,  # image_to_boxes doesn't give confidence
+                'confidence': CONFIDENCE_UNSCORED,  # overwritten by _score_char_confidence later
                 'bbox': (int(x0), int(y0), int(x1), int(y1)),
                 'method': 'boxes_psm6'
             })
@@ -165,7 +184,7 @@ class HebrewOCREngine:
         data = pytesseract.image_to_data(
             pil_image,
             lang=TESSERACT_LANG,
-            config=f'--psm 6 -c tessedit_char_whitelist={HEBREW_WHITELIST}',
+            config='--psm 6',
             output_type=pytesseract.Output.DICT
         )
 
@@ -227,16 +246,17 @@ class HebrewOCREngine:
             boxes_str = pytesseract.image_to_boxes(
                 pil_region,
                 lang=TESSERACT_LANG,
-                config=f'--psm 7 -c tessedit_char_whitelist={HEBREW_WHITELIST}'
+                config='--psm 7'
             )
         except Exception as e:
             print(f"  [Pass 2a] boxes failed: {e}")
             return []
 
         symbols = self._parse_boxes_string(boxes_str, reg_h, offset=(rx0, ry0))
-        # Tag method
+        # Tag method + get real confidence via PSM 10 per char
         for s in symbols:
             s['method'] = 'boxes_psm7'
+            s['confidence'] = self._score_char_confidence(image, s['bbox'])
 
         print(f"  [Pass 2a] PSM 7 boxes → {len(symbols)} chars")
         return symbols
@@ -268,9 +288,11 @@ class HebrewOCREngine:
         if ref_hebrew and len(components) == len(ref_hebrew):
             print(f"  [Pass 2b] CC count matches ref text → assigning 1:1")
             for idx, comp in enumerate(components):
+                # Get real confidence by running PSM 10 on the character crop
+                conf = self._score_char_confidence(image, comp['bbox'])
                 symbols.append({
                     'text': ref_hebrew[idx],
-                    'confidence': CONFIDENCE_FLOOR,
+                    'confidence': conf,
                     'bbox': comp['bbox'],
                     'method': 'cc_matched'
                 })
@@ -369,7 +391,10 @@ class HebrewOCREngine:
         return components
 
     def _recognize_char(self, image: np.ndarray, bbox: Tuple) -> Optional[Dict]:
-        """Run Tesseract PSM 10 (treat as single character) on a small cropped region."""
+        """
+        Run Tesseract PSM 10 on a crop to get text + real confidence.
+        Tries binarized first, falls back to raw grayscale if that fails.
+        """
         x0, y0, x1, y1 = bbox
         h_img, w_img = image.shape[:2]
         pad = 4
@@ -380,20 +405,30 @@ class HebrewOCREngine:
         if region.shape[0] < 5 or region.shape[1] < 5:
             return None
 
-        binary = self.binarize(region)
-        pil_region = Image.fromarray(binary)
+        # Try both binarized and raw grayscale — pick whichever gives real confidence
+        candidates = [self.binarize(region), region]
+        for variant in candidates:
+            try:
+                pil_region = Image.fromarray(variant)
+                data = pytesseract.image_to_data(
+                    pil_region,
+                    lang=TESSERACT_LANG,
+                    config='--psm 10',
+                    output_type=pytesseract.Output.DICT
+                )
+                for i in range(len(data['text'])):
+                    text = data['text'][i].strip()
+                    conf = float(data['conf'][i])
+                    if text and len(text) == 1 and conf > 0:
+                        return {'text': text, 'confidence': conf}
+            except Exception:
+                continue
+        return None
 
-        try:
-            text = pytesseract.image_to_string(
-                pil_region,
-                lang=TESSERACT_LANG,
-                config=f'--psm 10 -c tessedit_char_whitelist={HEBREW_WHITELIST}'
-            ).strip()
-            if text and len(text) == 1:
-                return {'text': text, 'confidence': CONFIDENCE_FLOOR}
-            return None
-        except Exception as e:
-            return None
+    def _score_char_confidence(self, image: np.ndarray, bbox: Tuple) -> float:
+        """Get Tesseract's confidence for a character at the given bbox (PSM 10)."""
+        result = self._recognize_char(image, bbox)
+        return result['confidence'] if result else CONFIDENCE_UNSCORED
 
     # ──────────────────────────────────────────────────
     # Optional EasyOCR cross-reference
@@ -537,11 +572,19 @@ class HebrewOCREngine:
                 all_symbols.extend(full_cc)
                 strategy_used = "S3 (full-image CC)"
 
-        # ── Hebrew filter ──
+        # ── Hebrew filter — drop non-Hebrew chars (Latin, punctuation, etc.) ──
         if only_hebrew:
             before = len(all_symbols)
             all_symbols = [s for s in all_symbols if HEBREW_REGEX.search(s['text'])]
-            print(f"[OCR] Hebrew filter: {len(all_symbols)}/{before}")
+            print(f"[OCR] Hebrew filter: kept {len(all_symbols)}/{before} (dropped {before - len(all_symbols)} non-Hebrew)")
+
+        # ── Confidence filter — drop low-confidence noise ──
+        before = len(all_symbols)
+        all_symbols = [s for s in all_symbols
+                       if s['confidence'] == CONFIDENCE_UNSCORED  # keep unscored (N/A)
+                       or s['confidence'] >= MIN_CHAR_CONFIDENCE]
+        if before != len(all_symbols):
+            print(f"[OCR] Confidence filter (>={MIN_CHAR_CONFIDENCE}): kept {len(all_symbols)}/{before}")
 
         # ── Deduplicate overlapping detections ──
         all_symbols = self._deduplicate(all_symbols)

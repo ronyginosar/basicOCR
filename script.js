@@ -53,7 +53,10 @@ const MIN_GLYPH_SIZE_PX    = 8;   // minimum width/height of a glyph bbox to kee
     dlCharZipBtn.disabled = true;
   }
   function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
-  function fmtConf(c) { return (typeof c === 'number' && isFinite(c)) ? c.toFixed(1) : String(c ?? ''); }
+  function fmtConf(c) {
+    if (typeof c !== 'number' || !isFinite(c)) return String(c ?? '');
+    return c < 0 ? 'N/A' : c.toFixed(1);  // -1 = unscored by engine
+  }
   function safeTextForFilename(t) {
     const txt = (t || '').trim();
     const rep = txt.length ? txt.replace(/\s/g, '␠') : 'space';
