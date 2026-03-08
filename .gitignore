@@ -3,3 +3,7 @@ ocr.js
 /assets
 /old
 /process
+/exports
+/.vscode
+/.cursor
+/backend/__pycache__/

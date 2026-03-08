@@ -47,6 +47,12 @@ TESSERACT_LANG = 'heb'         # Use 'heb+eng' if you have eng traineddata for b
 ENABLE_THINNING = False        # Set True for heavy/bold fonts — morphological erosion thins strokes
 THINNING_KERNEL_SIZE = 2       # Erosion kernel size (larger = more thinning, try 2–3)
 
+# ── Google Cloud Vision API (disabled by default) ──
+# Set to True AND provide credentials to use Google Vision for select images.
+# Requires: pip install google-cloud-vision
+# Auth: set GOOGLE_APPLICATION_CREDENTIALS env var to your service account JSON path
+ENABLE_GOOGLE_VISION = False
+
 # Hebrew Unicode detection
 HEBREW_RANGE = '\u0590-\u05FF'
 HEBREW_REGEX = re.compile(f'[{HEBREW_RANGE}]')
@@ -57,6 +63,13 @@ try:
     EASYOCR_AVAILABLE = True
 except ImportError:
     EASYOCR_AVAILABLE = False
+
+# Optional Google Cloud Vision
+try:
+    from google.cloud import vision as google_vision
+    GOOGLE_VISION_AVAILABLE = True
+except ImportError:
+    GOOGLE_VISION_AVAILABLE = False
 
 
 class HebrewOCREngine:
@@ -451,6 +464,112 @@ class HebrewOCREngine:
             return ""
 
     # ──────────────────────────────────────────────────
+    # Optional Google Cloud Vision API
+    # ──────────────────────────────────────────────────
+
+    def process_with_google_vision(self, image_path: str, only_hebrew: bool = True) -> Dict:
+        """
+        Use Google Cloud Vision API for character-level detection.
+        Returns same format as process_image() for seamless substitution.
+        """
+        if not GOOGLE_VISION_AVAILABLE:
+            raise RuntimeError("google-cloud-vision not installed — pip install google-cloud-vision")
+        if not ENABLE_GOOGLE_VISION:
+            raise RuntimeError("Google Vision is disabled — set ENABLE_GOOGLE_VISION = True in ocr_engine.py")
+
+        client = google_vision.ImageAnnotatorClient()
+        with open(image_path, 'rb') as f:
+            content = f.read()
+
+        gv_image = google_vision.Image(content=content)
+        response = client.text_detection(image=gv_image, image_context={'language_hints': ['he']})
+
+        if response.error.message:
+            raise RuntimeError(f"Google Vision API error: {response.error.message}")
+
+        img_bgr = cv2.imread(image_path)
+        img_h, img_w = img_bgr.shape[:2]
+        img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if len(img_bgr.shape) == 3 else img_bgr
+
+        all_symbols = []
+        # text_annotations[0] is the full text; [1:] are individual symbols
+        for annotation in response.text_annotations[1:]:
+            text = annotation.description.strip()
+            if not text or len(text) != 1:
+                continue
+
+            verts = annotation.bounding_poly.vertices
+            x0 = min(v.x for v in verts)
+            y0 = min(v.y for v in verts)
+            x1 = max(v.x for v in verts)
+            y1 = max(v.y for v in verts)
+
+            if (x1 - x0) < MIN_GLYPH_SIZE_PX or (y1 - y0) < MIN_GLYPH_SIZE_PX:
+                continue
+
+            all_symbols.append({
+                'text': text,
+                'confidence': annotation.score * 100 if hasattr(annotation, 'score') and annotation.score else CONFIDENCE_UNSCORED,
+                'bbox': (int(x0), int(y0), int(x1), int(y1)),
+                'method': 'google_vision'
+            })
+
+        # Hebrew filter
+        if only_hebrew:
+            all_symbols = [s for s in all_symbols if HEBREW_REGEX.search(s['text'])]
+
+        all_symbols = self._deduplicate(all_symbols)
+
+        # Refine bounding boxes
+        refined = []
+        for sym in all_symbols:
+            expanded = self.expand_box(sym['bbox'], CROP_BOX_MARGIN, img_w, img_h)
+            tight = self.refine_bbox_by_content(img_gray, expanded)
+            if tight is None:
+                tight = expanded
+            final = self.expand_box(tight, POST_REFINE_PADDING, img_w, img_h)
+            refined.append({
+                'text': sym['text'],
+                'confidence': float(sym['confidence']),
+                'bbox': tuple(int(v) for v in final),
+                'bbox_original': tuple(int(v) for v in sym['bbox']),
+                'method': 'google_vision'
+            })
+
+        # Per-character stats
+        char_stats = {}
+        for sym in refined:
+            ch = sym['text']
+            s = char_stats.setdefault(ch, {'count': 0, 'sum_conf': 0, 'min_conf': 100, 'max_conf': 0})
+            c = sym['confidence']
+            s['count'] += 1
+            s['sum_conf'] += c
+            s['min_conf'] = min(s['min_conf'], c)
+            s['max_conf'] = max(s['max_conf'], c)
+
+        print(f"[Google Vision] {len(refined)} Hebrew glyphs extracted")
+
+        return {
+            'source_image': image_path,
+            'width': int(img_w),
+            'height': int(img_h),
+            'count': len(refined),
+            'strategy': 'google_vision',
+            'words': [],
+            'symbols': refined,
+            'stats_by_char': [
+                {
+                    'char': ch,
+                    'count': int(s['count']),
+                    'avg_conf': float(s['sum_conf'] / s['count']),
+                    'min_conf': float(s['min_conf']),
+                    'max_conf': float(s['max_conf'])
+                }
+                for ch, s in char_stats.items()
+            ]
+        }
+
+    # ──────────────────────────────────────────────────
     # Bbox refinement utilities
     # ──────────────────────────────────────────────────
 
@@ -465,6 +584,65 @@ class HebrewOCREngine:
             return None
         rows = np.any(ink_mask, axis=1)
         cols = np.any(ink_mask, axis=0)
+        if not np.any(rows) or not np.any(cols):
+            return None
+        y_min, y_max = np.where(rows)[0][[0, -1]]
+        x_min, x_max = np.where(cols)[0][[0, -1]]
+        return (int(x0 + x_min), int(y0 + y_min), int(x0 + x_max + 1), int(y0 + y_max + 1))
+
+    def isolate_main_component(self, image: np.ndarray, padded_bbox: Tuple,
+                                original_center: Tuple[float, float]) -> Optional[Tuple]:
+        """
+        Within a padded region, find the connected component whose centroid is
+        closest to original_center and return its tight bounding box.
+        Prevents neighbor-letter ink from contaminating the crop.
+        """
+        x0, y0, x1, y1 = padded_bbox
+        region = image[y0:y1, x0:x1]
+        if region.size == 0:
+            return None
+
+        ink_mask = (region < CROP_LUM_THR).astype(np.uint8)
+        if not np.any(ink_mask):
+            return None
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(ink_mask, connectivity=8)
+        if num_labels <= 1:
+            return None
+
+        # Target center relative to the padded region
+        tcx = original_center[0] - x0
+        tcy = original_center[1] - y0
+
+        # Find the CC closest to the original detection center (skip label 0 = background)
+        best_label, best_dist = -1, float('inf')
+        for lid in range(1, num_labels):
+            area = int(stats[lid, cv2.CC_STAT_AREA])
+            if area < MIN_COMPONENT_AREA:
+                continue
+            cx, cy = float(centroids[lid][0]), float(centroids[lid][1])
+            dist = abs(cx - tcx) + abs(cy - tcy)
+            if dist < best_dist:
+                best_dist, best_label = dist, lid
+
+        if best_label < 0:
+            return None
+
+        # Merge nearby small CCs that likely belong to the same letter (dots, dagesh)
+        main_cx = float(centroids[best_label][0])
+        main_cy = float(centroids[best_label][1])
+        merged_mask = (labels == best_label)
+        for lid in range(1, num_labels):
+            if lid == best_label:
+                continue
+            area = int(stats[lid, cv2.CC_STAT_AREA])
+            cx, cy = float(centroids[lid][0]), float(centroids[lid][1])
+            dx, dy = abs(cx - main_cx), abs(cy - main_cy)
+            if dx < CC_MERGE_DISTANCE_X and dy < CC_MERGE_DISTANCE_Y:
+                merged_mask |= (labels == lid)
+
+        rows = np.any(merged_mask, axis=1)
+        cols = np.any(merged_mask, axis=0)
         if not np.any(rows) or not np.any(cols):
             return None
         y_min, y_max = np.where(rows)[0][[0, -1]]
@@ -590,14 +768,22 @@ class HebrewOCREngine:
         all_symbols = self._deduplicate(all_symbols)
         print(f"[OCR] After dedup: {len(all_symbols)} symbols")
 
-        # ── Refine bounding boxes ──
+        # ── Refine bounding boxes: isolate single letter, then tighten ──
         refined = []
         for sym in all_symbols:
-            expanded = self.expand_box(sym['bbox'], CROP_BOX_MARGIN, img_w, img_h)
-            tight = self.refine_bbox_by_content(img_pre, expanded)
-            if tight is None:
-                tight = expanded
-            final = self.expand_box(tight, POST_REFINE_PADDING, img_w, img_h)
+            orig = sym['bbox']
+            orig_cx = (orig[0] + orig[2]) / 2.0
+            orig_cy = (orig[1] + orig[3]) / 2.0
+            expanded = self.expand_box(orig, CROP_BOX_MARGIN, img_w, img_h)
+
+            # Isolate the main connected component closest to the detection center
+            isolated = self.isolate_main_component(img_pre, expanded, (orig_cx, orig_cy))
+            if isolated is None:
+                isolated = self.refine_bbox_by_content(img_pre, expanded)
+            if isolated is None:
+                isolated = expanded
+
+            final = self.expand_box(isolated, POST_REFINE_PADDING, img_w, img_h)
             refined.append({
                 'text': sym['text'],
                 'confidence': float(sym['confidence']),

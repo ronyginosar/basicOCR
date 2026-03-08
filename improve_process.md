@@ -291,3 +291,369 @@ All parameters are tunable at the top of `backend/ocr_engine.py`:
 3. **Vertical projection profiles** for glyph segmentation within word regions (handles touching letters)
 4. **Google Cloud Vision** as optional recognizer (best quality, paid API)
 
+---
+
+## Improvement Round 1: Debug Confidence & Word Splitting
+
+**Problem:** Tesseract `image_to_data` at level 5 returned entire words (e.g., `text='אבגדהוזחט'` with `conf=0.0`) instead of individual characters. Confidence was always 0 for the first two lines of Hebrew.
+
+**Root Cause:** `image_to_boxes` / `image_to_data` PSM 6 groups Hebrew characters into word-level entries at level 5. It does NOT segment individual Hebrew characters — it returns the full word string with 0.0 confidence (Tesseract honestly saying "I recognized this text but couldn't isolate individual characters").
+
+**Fix:** Updated extraction to detect when level 5 returns multi-character strings and split them into individual characters, estimating per-character bounding boxes by dividing the word bbox evenly.
+
+**Outcome:** All characters now detected individually. Confidence remained at 0 for some entries (addressed in later rounds).
+
+---
+
+## Improvement Round 2: Full Multi-Strategy Pipeline Rewrite
+
+**Problem:** The initial single-pass approach was fragile. Needed a robust pipeline that tries multiple strategies to maximize detection.
+
+**What Changed:** Complete rewrite of `ocr_engine.py` to implement the three-strategy cascade:
+
+- **Strategy 1 — `image_to_boxes` PSM 6 on full image (fast path):** Uses Tesseract's box-file mode which often returns per-character bounding boxes. If ≥2 Hebrew chars found, uses these directly.
+
+- **Strategy 2 — Two-pass pipeline:**
+  - **Pass 1:** `image_to_data` PSM 6 → word bounding boxes (level 4) + reference text (level 5)
+  - **Pass 2a:** `image_to_boxes` PSM 7 (single text line) on each word region → per-char boxes
+  - **Pass 2b (fallback):** Connected-components segmentation via `cv2.connectedComponentsWithStats`:
+    - Finds individual ink blobs
+    - Merges small components (dots, dagesh, niqqud) into nearest large neighbor
+    - If CC count matches reference text length → assigns characters 1:1 (RTL order)
+    - Otherwise → runs PSM 10 (single character) on each component
+
+- **Strategy 3 — Full-image connected components (last resort):** If no word regions found, runs CC + PSM 10 on the entire image.
+
+**Added PSM Documentation to file header:**
+- PSM 6 = Assume a single uniform block of text (good for detecting words/lines)
+- PSM 7 = Treat the image as a single text line (good for per-char extraction in a word)
+- PSM 10 = Treat the image as a single character (good for recognizing one glyph)
+
+**Outcome:** All 27 Hebrew characters (including 5 final forms) detected correctly on test images. Strategy 1 (fast path) succeeded on clean typography images.
+
+---
+
+## Improvement Round 3: Real Confidence Scoring
+
+**Problem:** All detected characters showed confidence = 40 (the `CONFIDENCE_FLOOR` constant), because `image_to_boxes` doesn't return confidence scores — only character + bbox.
+
+**Fix:** After `image_to_boxes` finds accurate bounding boxes, a new `_score_char_confidence()` method runs a quick PSM 10 `image_to_data` on each character crop to get Tesseract's actual confidence value.
+
+**Trade-off:** Adds one PSM 10 call per character (small processing overhead) but provides meaningful confidence values for quality assessment.
+
+**Outcome:** Real per-character confidence scores now visible (e.g., 85.2, 92.1) instead of flat 40s. Some characters still returned no score (addressed next).
+
+---
+
+## Improvement Round 4: Honest Confidence Labeling (N/A instead of fake scores)
+
+**Problem:** Some characters still showed confidence = 40 despite the PSM 10 scoring. The arbitrary `CONFIDENCE_FLOOR` of 40 looked like a real score and was misleading.
+
+**Fixes:**
+1. **Try harder to get real confidence:** `_recognize_char()` now tries both binarized AND raw grayscale variants — picks whichever produces a real confidence score first.
+2. **Honest "N/A" labeling:** Changed `CONFIDENCE_FLOOR` to `CONFIDENCE_UNSCORED = -1.0` as a sentinel value. Frontend displays this as **"N/A"** instead of a fake number.
+3. **Only real scores shown:** If you see a number like `85.2`, it's Tesseract's actual confidence. If you see `N/A`, Tesseract couldn't score it (the detection came from `image_to_boxes` which has no confidence, and PSM 10 verification also failed).
+
+**Outcome:** Clear distinction between scored and unscored characters. No more misleading confidence values.
+
+---
+
+## Improvement Round 5: Heavy Fonts & Latin Character Filtering
+
+**Problem — Two issues identified during broader testing:**
+1. **Heavy/bold fonts** cause misrecognition — thick strokes distort character shapes for Tesseract.
+2. **Latin characters on mixed images** get force-mapped to Hebrew by the `tessedit_char_whitelist`, polluting detection folders with hundreds of misdetected characters (e.g., Latin "A" → nearest Hebrew letter).
+
+**Fix for Latin noise (Issue 2) — Removed the whitelist approach entirely:**
+- **Before:** `tessedit_char_whitelist` forced every detection to be Hebrew → Latin characters got mapped to wrong Hebrew chars
+- **After:** Tesseract detects freely (no whitelist). Latin chars come through as Latin. The existing Hebrew Unicode regex filter (`\u0590-\u05FF`) drops non-Hebrew chars cleanly.
+- Removed the `HEBREW_WHITELIST` constant entirely from `ocr_engine.py`
+- Added `MIN_CHAR_CONFIDENCE = 15.0` — drops characters with real confidence below this threshold to further reduce noise
+
+**Fix for heavy fonts (Issue 1) — Optional morphological thinning:**
+- New parameter `ENABLE_THINNING = False` (set `True` for heavy/bold fonts)
+- New parameter `THINNING_KERNEL_SIZE = 2` (try 2–3)
+- When enabled, applies morphological erosion to thin heavy strokes before OCR processing
+- Requires server restart after changing
+
+**Console output now shows filtering steps:**
+```
+[OCR] Hebrew filter: kept 25/31 (dropped 6 non-Hebrew)
+[OCR] Confidence filter (>=15.0): kept 24/25
+```
+
+**Outcome:** Mixed Hebrew+Latin images now cleanly extract only Hebrew characters. Heavy fonts can be handled by toggling thinning. Significantly reduced noise in detection output.
+
+---
+
+## Updated Configuration (after all rounds)
+
+All parameters at the top of `backend/ocr_engine.py`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `CROP_BOX_MARGIN` | 4 | px padding around detected bbox |
+| `POST_REFINE_PADDING` | 2 | px padding after ink-tightening |
+| `CROP_LUM_THR` | 220 | Luminance threshold for ink detection (0–255) |
+| `MIN_GLYPH_SIZE_PX` | 8 | Minimum glyph bbox width/height |
+| `MIN_COMPONENT_AREA` | 40 | Minimum CC pixel area |
+| `WORD_REGION_PADDING` | 6 | px padding when cropping word regions |
+| `CONFIDENCE_UNSCORED` | -1.0 | Sentinel for "no real confidence" (displayed as N/A) |
+| `MIN_CHAR_CONFIDENCE` | 15.0 | Drop chars with real confidence below this |
+| `CC_SMALL_RATIO` | 0.20 | CCs below this fraction of median area → "dot" |
+| `CC_MERGE_DISTANCE_X` | 20 | Max horizontal distance to merge dot into letter |
+| `CC_MERGE_DISTANCE_Y` | 35 | Max vertical distance to merge dot into letter |
+| `MIN_CHARS_FOR_STRATEGY` | 2 | Minimum chars for a strategy to be accepted |
+| `OVERLAP_THRESHOLD` | 0.45 | IoU threshold for deduplication |
+| `TESSERACT_LANG` | 'heb' | Language model (use 'heb+eng' for mixed scripts) |
+| `ENABLE_THINNING` | False | Morphological erosion for heavy/bold fonts |
+| `THINNING_KERNEL_SIZE` | 2 | Erosion kernel size (larger = more thinning) |
+
+## Improvement Round 6: Google Vision API Integration (Disabled by Default)
+
+**Goal:** Have Google Cloud Vision available as an optional high-quality engine for select images, without disrupting the current Tesseract-based workflow.
+
+**What was added:**
+- **`ENABLE_GOOGLE_VISION = False`** flag at top of `ocr_engine.py` — clear gate, off by default
+- **`process_with_google_vision()`** method in `HebrewOCREngine` — uses `google.cloud.vision.ImageAnnotatorClient` with Hebrew language hints
+- **`POST /api/ocr/process-google-vision`** endpoint in `api.py` — same response format as the Tesseract endpoint
+- **UI checkbox** "Use Google Cloud Vision API (requires setup)" — unchecked by default
+- **`google-cloud-vision>=3.4.0`** in `requirements.txt` (commented out)
+
+**To enable:**
+1. `pip install google-cloud-vision`
+2. Set `GOOGLE_APPLICATION_CREDENTIALS` env var to your service account JSON
+3. Set `ENABLE_GOOGLE_VISION = True` in `ocr_engine.py`
+4. Check both "Use Python backend" and "Use Google Cloud Vision API" in the UI
+
+**Also changed:** Both UI checkboxes ("Keep only Hebrew" and "Use Python backend") now default to checked.
+
+---
+
+## Improvement Round 7: Single-Letter Crop Isolation
+
+**Problem:** On complex posters and specimen images, two crop issues occurred:
+1. **Multi-letter crops:** The crop around a correctly-detected single letter would show neighboring letters bleeding in.
+2. **Shifted crops:** The crop was offset — showing half the detected letter and half the adjacent letter.
+
+**Root Cause:** `refine_bbox_by_content()` found ALL ink pixels (below luminance threshold) within the padded region. When the `CROP_BOX_MARGIN` padding captured ink from neighboring letters, the refinement expanded or shifted the crop to include that neighbor ink.
+
+**Fix — `isolate_main_component()` in `ocr_engine.py`:**
+1. After expanding the detection bbox by `CROP_BOX_MARGIN`, run `cv2.connectedComponentsWithStats` on the padded region's ink mask
+2. Find the connected component whose centroid is **closest to the center of the original detection bbox** — this is the actual detected letter
+3. Merge nearby small CCs (dots, dagesh, niqqud) that likely belong to the same letter (using `CC_MERGE_DISTANCE_X/Y`)
+4. Return only that component's tight bounding box
+5. Apply `POST_REFINE_PADDING` for breathing room
+
+Falls back to the old `refine_bbox_by_content()` if component isolation fails (e.g., no ink found).
+
+**Outcome:** Each crop now isolates exactly one letter, anchored to the detection center. Neighbor ink is excluded even in tightly-spaced typography.
+
+---
+
+## Improvement Round 8: PDF & Multi-Page TIFF Support
+
+**Problem:** Some specimen sources are multi-page PDFs or multi-page TIFFs. The backend only handled single-image files (JPEG, PNG, single-page TIFF).
+
+**What was added:**
+- **`pdf2image>=1.16.0`** in `requirements.txt` + `poppler` system dependency (via `brew install poppler`)
+- **`split_to_page_images()`** helper in `api.py`:
+  - **PDFs:** converts each page to PNG at 300 DPI via `pdf2image.convert_from_path()`
+  - **Multi-page TIFFs:** iterates PIL frames (`pil_img.seek(i)`), saves each as PNG
+  - **Single images:** pass through unchanged
+- **Multi-page response format:** When input has multiple pages, the API returns `{ pages: [...], total_pages: N }` with per-page results. Single-page files return the same format as before (backward compatible).
+- **Frontend handles both formats:** `runOCRBackend()` normalizes multi-page responses via `result.pages || [result]` and processes each page, labeling crops with page numbers.
+- **File input accepts PDFs:** Updated `accept` attribute to include `.pdf,.PDF`
+
+**Setup:**
+```bash
+conda activate hebrew-ocr
+pip install pdf2image
+brew install poppler   # macOS — provides pdftoppm
+```
+
+---
+
+## Improvement Round 9: Color Crop Previews
+
+**Problem:** The backend cropped from the preprocessed grayscale image, so all gallery previews were black and white. For visual inspection of detection quality on colorful posters/typography, color crops are more useful.
+
+**What was added:**
+- **Backend sends both crops:** `_generate_crops()` helper in `api.py` returns `image_data` (BW) and `image_data_color` (color from original BGR image) for every symbol
+- **UI checkbox:** "Color crop previews (downloads always BW)" — checked by default
+- **Gallery respects toggle:** When color checkbox is on, preview uses `image_data_color`; when off, uses `image_data` (BW)
+- **Downloads always BW:** ZIP files use `image_data` regardless of the toggle — consistent for training data
+
+**Also refactored:** Frontend code deduplicated into shared `processPageResult()` and `finalizeCharBuckets()` helpers, used by both the Tesseract and Google Vision code paths. Eliminated ~150 lines of duplicated logic.
+
+---
+
+## Current Status
+
+- **Detection accuracy:** All 27 Hebrew characters (22 base + 5 final forms) detected correctly on clean typography
+- **Single-letter isolation:** Crops anchored to the main connected component closest to detection center
+- **Mixed-script images:** Latin and non-Hebrew characters cleanly filtered out via Unicode regex
+- **Confidence scoring:** Real Tesseract confidence per character, with honest N/A for unscored
+- **Heavy fonts:** Optional thinning toggle for bold/heavy typography
+- **Multi-strategy cascade:** Automatically selects the best extraction approach per image
+- **PDF & multi-page TIFF:** Automatically split into per-page processing
+- **Color previews:** Gallery shows color crops by default, downloads always BW
+- **Google Vision:** Available as optional engine (disabled by default, requires credentials)
+
+---
+
+## Remaining Improvement Branches (Before Declaring "Best Case")
+
+These are concrete branches still worth exploring with the current architecture, roughly ordered by expected impact-to-effort ratio:
+
+### Branch A: Adaptive Preprocessing Per Image Type (High Impact, Medium Effort)
+The current preprocessing is one-size-fits-all: CLAHE + optional thinning. Different image types need different treatment:
+- **Light fonts on dark backgrounds** — inversion before binarization
+- **Low-contrast images** — more aggressive CLAHE or adaptive thresholding (instead of Otsu)
+- **Colored text on colored backgrounds** — color-channel separation before grayscale
+- **Noisy/textured backgrounds** — denoising (Gaussian/median blur) before binarization
+
+**Approach:** Add an auto-detect step that inspects histogram/foreground stats and picks the best preprocessing path. Or expose a "preprocessing preset" dropdown in the UI.
+
+### Branch B: Vertical Projection Profiles for Glyph Segmentation (Medium Impact, Medium Effort)
+Connected-components work well for separated letters, but **touching/overlapping glyphs** (common in cursive, serif, or tight typography) need a different approach:
+- Compute vertical projection profile (column-wise ink density) within each word region
+- Find valleys (low-ink columns) as split points between characters
+- This handles cases where CC merges two touching letters into one blob
+
+### Branch C: EasyOCR as Primary Recognizer (Medium Impact, Low Effort)
+Currently EasyOCR is only used for optional cross-reference text. Using it as the **primary recognizer** (instead of Tesseract PSM 10) for individual character crops could improve accuracy on stylized fonts, since EasyOCR's deep-learning model has seen more font variety.
+
+**Approach:** In `_recognize_char()`, try EasyOCR first, fall back to Tesseract. Or run both and pick the higher-confidence result.
+
+### Branch D: Image DPI / Resolution Normalization (Low-Medium Impact, Low Effort)
+Tesseract expects ~300 DPI. Very high-res or very low-res images get worse results.
+- Auto-detect resolution and resize to ~300 DPI equivalent before OCR
+- For character crops sent to PSM 10, upscale small crops (e.g., below 32px) to a minimum size
+
+### Branch E: Post-OCR Confusion Correction (Low Impact, Low Effort)
+Some Hebrew characters are systematically confused (e.g., ד/ר, ו/ז, ב/כ, ח/ת).
+- Track confusion patterns from the test set
+- Apply rule-based corrections (e.g., if PSM 10 returns ר with low confidence but the crop shape is more square than tall, flip to ד)
+- Or train a tiny classifier on the confusion pairs
+
+### Branch F: Multi-Engine Ensemble Voting (Medium Impact, High Effort)
+Run both Tesseract and EasyOCR (and optionally Google Vision) on the same character crop. Pick the result with highest confidence, or use majority voting if 2+ engines agree.
+
+### When to Declare "Best Case"
+Stop iterating when:
+1. The **test score** (see Testing Methodology below) plateaus across 2+ consecutive changes
+2. Remaining false positives are **image-quality issues** (blur, extreme distortion) rather than engine bugs
+3. The effort to fix the remaining errors exceeds the effort to manually delete them
+
+---
+
+## Testing Methodology: OCR Benchmark Score
+
+### Why
+Random ad-hoc testing gives no baseline. We need a repeatable test that produces a numeric score, so we can measure whether each change is an improvement, regression, or neutral.
+
+### Ground Truth Set: 10 Reference Images
+Select 10 images that cover the range of difficulty:
+
+| # | Image Type | Purpose |
+|---|-----------|---------|
+| 1 | Clean black text on white, standard font | Baseline — should be near-perfect |
+| 2 | Clean black text, serif/decorative font | Standard + font variety |
+| 3 | Bold/heavy font | Tests thinning |
+| 4 | Light/thin font | Tests contrast enhancement |
+| 5 | Mixed Hebrew + Latin text | Tests script filtering |
+| 6 | Colored text on colored background | Tests preprocessing |
+| 7 | Low resolution / small text | Tests DPI handling |
+| 8 | Dense/tight letter spacing | Tests CC splitting |
+| 9 | Poster/artwork with Hebrew | Tests real-world noise |
+| 10 | Handwritten or highly stylized | Edge case — expected lower accuracy |
+
+### Ground Truth Annotation
+For each image, manually create a JSON file listing the **expected characters** and their approximate bounding boxes:
+
+```json
+{
+  "image": "test_01_clean_standard.tiff",
+  "expected_chars": ["א", "ב", "ג", "ד", "ה", "ו", "ז", "ח", "ט"],
+  "total_expected": 9,
+  "notes": "3 rows of 3 chars each, clean background"
+}
+```
+
+### Scoring Formula
+
+For each image, compute:
+- **True Positives (TP):** OCR detected a correct Hebrew char that exists in the ground truth
+- **False Positives (FP):** OCR detected something that isn't in the ground truth (wrong char or phantom detection)
+- **False Negatives (FN):** A ground-truth char that OCR missed entirely
+
+Then:
+- **Precision** = TP / (TP + FP) — "how many detections are correct"
+- **Recall** = TP / (TP + FN) — "how many real chars did we find"
+- **F1** = 2 × (Precision × Recall) / (Precision + Recall) — balanced score
+
+**Overall OCR Score** = average F1 across all 10 images (0–100 scale).
+
+### Running the Test
+A test script (`backend/test_benchmark.py`) that:
+1. Reads the 10 images from a `test_images/` folder
+2. Reads the ground-truth JSON files from `test_images/ground_truth/`
+3. Runs the OCR pipeline on each
+4. Compares detected chars vs expected chars (character-level matching)
+5. Outputs a scorecard:
+
+```
+Image                      | TP  | FP  | FN  | Precision | Recall | F1
+test_01_clean_standard     |  9  |  0  |  0  |   100.0%  | 100.0% | 100.0
+test_05_mixed_hebrew_latin |  15 |  2  |  1  |    88.2%  |  93.8% |  90.9
+...
+─────────────────────────────────────────────────────────────
+OVERALL                    |     |     |     |    91.3%  |  94.7% |  93.0
+```
+
+### How to Use It
+1. Run benchmark **before** making a change → record score
+2. Make the change
+3. Run benchmark **after** → compare score
+4. If score improved or held → keep the change
+5. If score dropped → investigate which images regressed and why
+
+---
+
+## Image Count Estimation: How Many Source Images for ~100 Crops Per Character
+
+### The Math
+
+Hebrew has **27 characters** (22 base + 5 final forms: ך ם ן ף ץ).
+
+The average yield per image depends on image type:
+- **Alphabet reference images** (all 27 chars in rows): ~25 chars/image
+- **Word/sentence images**: ~10–20 unique chars/image (some chars repeat, some are rare)
+- **Real-world typography**: ~5–15 unique chars/image (highly variable)
+
+**Key insight:** Not all characters appear equally. Common chars (א, ב, ה, ו, ל, מ, ר, ת) appear in almost every word. Rare chars (especially final forms: ך, ץ, ף) appear much less frequently.
+
+### Estimates
+
+| Source Type | Chars/image (avg) | Images for 100/char (common) | Images for 100/char (rare finals) |
+|---|---|---|---|
+| Alphabet sheets (all 27 in each) | 27 | ~100 | ~100 |
+| Word/sentence typography | ~15 unique | ~150–200 | ~300–500 |
+| Mixed real-world images | ~10 unique | ~200–300 | ~500–1000 |
+
+### Practical Recommendation
+
+- **Fastest path to 100/char:** Create **~100 alphabet reference images** in different fonts/styles. Each image contains all 27 characters → 100 images gives exactly 100 crops per char.
+- **For variety:** Supplement with **~50–100 word/sentence images** to add natural context (different sizes, positions, neighboring-letter effects).
+- **Total estimate:** **100–150 images** if they're mostly full-alphabet sheets, or **200–400 images** if they're natural word/sentence typography.
+
+### Final-Form Characters (ך ם ן ף ץ)
+These only appear at the end of words, so:
+- In alphabet sheets: they appear once each → same as others
+- In word images: they appear ~3× less often than common letters
+- **Mitigation:** Include words that specifically end with each final form, or create dedicated sheets for finals
+
+### Bottom Line
+If you design images intentionally (alphabet sheets in varied fonts/styles), **~100–120 images** should close the chapter with 100+ crops per character folder, including the rare finals.
+
