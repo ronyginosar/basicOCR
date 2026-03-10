@@ -31,7 +31,7 @@ import re
 
 CROP_BOX_MARGIN = 4            # px padding around detected bbox (pre-refine)
 POST_REFINE_PADDING = 2        # px padding after ink-tightening
-CROP_LUM_THR = 220             # 0..255 luminance threshold for ink detection
+CROP_LUM_THR = 220             # (deprecated — replaced by Otsu auto-threshold in _make_text_mask)
 MIN_GLYPH_SIZE_PX = 8          # minimum width/height to keep a glyph bbox
 MIN_COMPONENT_AREA = 40        # minimum pixel area for a connected component
 WORD_REGION_PADDING = 6        # px padding when cropping word regions for Pass 2
@@ -42,6 +42,8 @@ CC_MERGE_DISTANCE_X = 20       # max horizontal px to merge a small CC into a la
 CC_MERGE_DISTANCE_Y = 35       # max vertical px to merge a small CC into a large one
 MIN_CHARS_FOR_STRATEGY = 2     # minimum chars for a strategy to be accepted
 OVERLAP_THRESHOLD = 0.45       # IoU threshold for deduplication
+CROP_HORIZ_TOLERANCE = 4       # px tolerance for horizontal overlap test when filtering neighbor CCs from crop
+DEOVERLAP_VERT_RATIO = 0.5    # minimum vertical overlap ratio to consider two bboxes on the same line
 
 TESSERACT_LANG = 'heb'         # Use 'heb+eng' if you have eng traineddata for better script separation
 ENABLE_THINNING = False        # Set True for heavy/bold fonts — morphological erosion thins strokes
@@ -573,81 +575,97 @@ class HebrewOCREngine:
     # Bbox refinement utilities
     # ──────────────────────────────────────────────────
 
+    def _make_text_mask(self, gray_region: np.ndarray) -> np.ndarray:
+        """
+        Binary mask where text pixels = 1, background = 0.
+        Uses Otsu to auto-detect threshold; normalizes polarity so text is always
+        foreground — works for both dark-on-light and light-on-dark images.
+        """
+        _, binary = cv2.threshold(gray_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if np.mean(binary) > 127:
+            binary = cv2.bitwise_not(binary)
+        return (binary > 0).astype(np.uint8)
+
     def refine_bbox_by_content(self, image: np.ndarray, bbox: Tuple) -> Optional[Tuple]:
-        """Tighten bounding box to actual ink pixels (below luminance threshold)."""
+        """Tighten bounding box to actual text pixels (auto-detects polarity)."""
         x0, y0, x1, y1 = bbox
         region = image[y0:y1, x0:x1]
-        if region.size == 0:
+        if region.size == 0 or region.shape[0] < 3 or region.shape[1] < 3:
             return None
-        ink_mask = region < CROP_LUM_THR
-        if not np.any(ink_mask):
+        text_mask = self._make_text_mask(region)
+        if not np.any(text_mask):
             return None
-        rows = np.any(ink_mask, axis=1)
-        cols = np.any(ink_mask, axis=0)
+        rows = np.any(text_mask, axis=1)
+        cols = np.any(text_mask, axis=0)
         if not np.any(rows) or not np.any(cols):
             return None
         y_min, y_max = np.where(rows)[0][[0, -1]]
         x_min, x_max = np.where(cols)[0][[0, -1]]
         return (int(x0 + x_min), int(y0 + y_min), int(x0 + x_max + 1), int(y0 + y_max + 1))
 
-    def isolate_main_component(self, image: np.ndarray, padded_bbox: Tuple,
-                                original_center: Tuple[float, float]) -> Optional[Tuple]:
+    def refine_crop_for_letter(self, image: np.ndarray, padded_bbox: Tuple,
+                               original_bbox: Tuple) -> Optional[Tuple]:
         """
-        Within a padded region, find the connected component whose centroid is
-        closest to original_center and return its tight bounding box.
-        Prevents neighbor-letter ink from contaminating the crop.
+        Refine a crop keeping only text belonging to the detected letter.
+        Uses Otsu binarization so it works for both dark-on-light and light-on-dark.
+
+        Strategy: CCs whose horizontal span overlaps the original Tesseract bbox
+        are the same letter; CCs entirely outside are neighbors to exclude.
+        Result is never smaller than the original bbox (prevents over-cropping).
         """
-        x0, y0, x1, y1 = padded_bbox
-        region = image[y0:y1, x0:x1]
-        if region.size == 0:
+        px0, py0, px1, py1 = padded_bbox
+        region = image[py0:py1, px0:px1]
+        if region.size == 0 or region.shape[0] < 3 or region.shape[1] < 3:
             return None
 
-        ink_mask = (region < CROP_LUM_THR).astype(np.uint8)
-        if not np.any(ink_mask):
+        text_mask = self._make_text_mask(region)
+        if not np.any(text_mask):
             return None
 
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(ink_mask, connectivity=8)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(text_mask, connectivity=8)
         if num_labels <= 1:
             return None
 
-        # Target center relative to the padded region
-        tcx = original_center[0] - x0
-        tcy = original_center[1] - y0
+        # Original bbox horizontal span, relative to the padded region
+        orig_left = original_bbox[0] - px0
+        orig_right = original_bbox[2] - px0
+        tol = CROP_HORIZ_TOLERANCE
 
-        # Find the CC closest to the original detection center (skip label 0 = background)
-        best_label, best_dist = -1, float('inf')
+        # Keep CCs that horizontally overlap with the original bbox (± tolerance)
+        kept_mask = np.zeros_like(text_mask, dtype=bool)
         for lid in range(1, num_labels):
             area = int(stats[lid, cv2.CC_STAT_AREA])
             if area < MIN_COMPONENT_AREA:
                 continue
-            cx, cy = float(centroids[lid][0]), float(centroids[lid][1])
-            dist = abs(cx - tcx) + abs(cy - tcy)
-            if dist < best_dist:
-                best_dist, best_label = dist, lid
+            cc_left = int(stats[lid, cv2.CC_STAT_LEFT])
+            cc_right = cc_left + int(stats[lid, cv2.CC_STAT_WIDTH])
 
-        if best_label < 0:
+            # Horizontal overlap test: CC overlaps with original bbox
+            has_overlap = cc_right > (orig_left - tol) and cc_left < (orig_right + tol)
+            if has_overlap:
+                kept_mask |= (labels == lid)
+
+        if not np.any(kept_mask):
             return None
 
-        # Merge nearby small CCs that likely belong to the same letter (dots, dagesh)
-        main_cx = float(centroids[best_label][0])
-        main_cy = float(centroids[best_label][1])
-        merged_mask = (labels == best_label)
-        for lid in range(1, num_labels):
-            if lid == best_label:
-                continue
-            area = int(stats[lid, cv2.CC_STAT_AREA])
-            cx, cy = float(centroids[lid][0]), float(centroids[lid][1])
-            dx, dy = abs(cx - main_cx), abs(cy - main_cy)
-            if dx < CC_MERGE_DISTANCE_X and dy < CC_MERGE_DISTANCE_Y:
-                merged_mask |= (labels == lid)
-
-        rows = np.any(merged_mask, axis=1)
-        cols = np.any(merged_mask, axis=0)
+        rows = np.any(kept_mask, axis=1)
+        cols = np.any(kept_mask, axis=0)
         if not np.any(rows) or not np.any(cols):
             return None
         y_min, y_max = np.where(rows)[0][[0, -1]]
         x_min, x_max = np.where(cols)[0][[0, -1]]
-        return (int(x0 + x_min), int(y0 + y_min), int(x0 + x_max + 1), int(y0 + y_max + 1))
+
+        refined = (int(px0 + x_min), int(py0 + y_min),
+                   int(px0 + x_max + 1), int(py0 + y_max + 1))
+
+        # Never crop smaller than the original bbox (prevents over-cropping)
+        final = (
+            min(refined[0], original_bbox[0]),
+            min(refined[1], original_bbox[1]),
+            max(refined[2], original_bbox[2]),
+            max(refined[3], original_bbox[3])
+        )
+        return final
 
     def expand_box(self, bbox: Tuple, margin: int, max_w: int, max_h: int) -> Tuple:
         """Expand bounding box by margin, clamped to image bounds."""
@@ -677,6 +695,34 @@ class HebrewOCREngine:
             if not is_dup:
                 kept.append(sym)
         return kept
+
+    def _deoverlap_bboxes(self, symbols: List[Dict]) -> List[Dict]:
+        """
+        Split horizontally overlapping bboxes at the midpoint of their overlap.
+        Prevents one letter's crop from bleeding into a neighbor when Tesseract
+        gives imprecise, overlapping bounding boxes.
+        """
+        if len(symbols) <= 1:
+            return symbols
+        sorted_syms = sorted(symbols, key=lambda s: s['bbox'][0])
+        for i in range(len(sorted_syms) - 1):
+            ax0, ay0, ax1, ay1 = sorted_syms[i]['bbox']
+            bx0, by0, bx1, by1 = sorted_syms[i + 1]['bbox']
+
+            vert_overlap = min(ay1, by1) - max(ay0, by0)
+            min_height = min(ay1 - ay0, by1 - by0)
+            if min_height <= 0 or vert_overlap < min_height * DEOVERLAP_VERT_RATIO:
+                continue
+
+            horiz_overlap = min(ax1, bx1) - max(ax0, bx0)
+            if horiz_overlap <= 0:
+                continue
+
+            mid = (max(ax0, bx0) + min(ax1, bx1)) // 2
+            sorted_syms[i]['bbox'] = (ax0, ay0, mid, ay1)
+            sorted_syms[i + 1]['bbox'] = (mid, by0, bx1, by1)
+            print(f"[DEOVERLAP] split '{sorted_syms[i]['text']}'/'{sorted_syms[i+1]['text']}' at x={mid}")
+        return sorted_syms
 
     # ──────────────────────────────────────────────────
     # Main pipeline
@@ -768,22 +814,26 @@ class HebrewOCREngine:
         all_symbols = self._deduplicate(all_symbols)
         print(f"[OCR] After dedup: {len(all_symbols)} symbols")
 
-        # ── Refine bounding boxes: isolate single letter, then tighten ──
+        # ── De-overlap: split bboxes that bleed into neighbor letters ──
+        all_symbols = self._deoverlap_bboxes(all_symbols)
+
+        # ── Refine bounding boxes: keep letter parts, exclude neighbors ──
         refined = []
         for sym in all_symbols:
             orig = sym['bbox']
-            orig_cx = (orig[0] + orig[2]) / 2.0
-            orig_cy = (orig[1] + orig[3]) / 2.0
             expanded = self.expand_box(orig, CROP_BOX_MARGIN, img_w, img_h)
 
-            # Isolate the main connected component closest to the detection center
-            isolated = self.isolate_main_component(img_pre, expanded, (orig_cx, orig_cy))
-            if isolated is None:
-                isolated = self.refine_bbox_by_content(img_pre, expanded)
-            if isolated is None:
-                isolated = expanded
+            tight = self.refine_crop_for_letter(img_pre, expanded, orig)
+            refine_method = "crop_for_letter"
+            if tight is None:
+                tight = self.refine_bbox_by_content(img_pre, expanded)
+                refine_method = "bbox_by_content"
+            if tight is None:
+                tight = expanded
+                refine_method = "fallback_expanded"
 
-            final = self.expand_box(isolated, POST_REFINE_PADDING, img_w, img_h)
+            final = self.expand_box(tight, POST_REFINE_PADDING, img_w, img_h)
+            print(f"[REFINE] '{sym['text']}' orig={orig} expanded={expanded} tight={tight} final={final} method={refine_method}")
             refined.append({
                 'text': sym['text'],
                 'confidence': float(sym['confidence']),

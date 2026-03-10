@@ -191,7 +191,7 @@ The engine now tries three strategies in order until one succeeds:
 
 **Bounding Box Refinement:**
 - Padding around detected bbox (`CROP_BOX_MARGIN = 4px`)
-- Ink-based tightening using luminance threshold (`CROP_LUM_THR = 220`)
+- Ink-based tightening using Otsu auto-threshold (polarity-aware)
 - Post-refine padding (`POST_REFINE_PADDING = 2px`)
 - Minimum glyph size filter (`MIN_GLYPH_SIZE_PX = 8px`)
 - Overlap deduplication (`OVERLAP_THRESHOLD = 0.45`)
@@ -274,7 +274,7 @@ All parameters are tunable at the top of `backend/ocr_engine.py`:
 |-----------|---------|-------------|
 | `CROP_BOX_MARGIN` | 4 | px padding around detected bbox |
 | `POST_REFINE_PADDING` | 2 | px padding after ink-tightening |
-| `CROP_LUM_THR` | 220 | Luminance threshold for ink detection (0–255) |
+| `CROP_LUM_THR` | 220 | *(deprecated)* Replaced by Otsu auto-threshold in `_make_text_mask()` |
 | `MIN_GLYPH_SIZE_PX` | 8 | Minimum glyph bbox width/height |
 | `MIN_COMPONENT_AREA` | 40 | Minimum CC pixel area |
 | `WORD_REGION_PADDING` | 6 | px padding when cropping word regions |
@@ -394,7 +394,7 @@ All parameters at the top of `backend/ocr_engine.py`:
 |-----------|---------|-------------|
 | `CROP_BOX_MARGIN` | 4 | px padding around detected bbox |
 | `POST_REFINE_PADDING` | 2 | px padding after ink-tightening |
-| `CROP_LUM_THR` | 220 | Luminance threshold for ink detection (0–255) |
+| `CROP_LUM_THR` | 220 | *(deprecated)* Replaced by Otsu auto-threshold in `_make_text_mask()` |
 | `MIN_GLYPH_SIZE_PX` | 8 | Minimum glyph bbox width/height |
 | `MIN_COMPONENT_AREA` | 40 | Minimum CC pixel area |
 | `WORD_REGION_PADDING` | 6 | px padding when cropping word regions |
@@ -405,9 +405,11 @@ All parameters at the top of `backend/ocr_engine.py`:
 | `CC_MERGE_DISTANCE_Y` | 35 | Max vertical distance to merge dot into letter |
 | `MIN_CHARS_FOR_STRATEGY` | 2 | Minimum chars for a strategy to be accepted |
 | `OVERLAP_THRESHOLD` | 0.45 | IoU threshold for deduplication |
+| `CROP_HORIZ_TOLERANCE` | 4 | px tolerance for horizontal overlap test in crop refinement |
 | `TESSERACT_LANG` | 'heb' | Language model (use 'heb+eng' for mixed scripts) |
 | `ENABLE_THINNING` | False | Morphological erosion for heavy/bold fonts |
 | `THINNING_KERNEL_SIZE` | 2 | Erosion kernel size (larger = more thinning) |
+| `ENABLE_GOOGLE_VISION` | False | Google Cloud Vision API gate (requires credentials) |
 
 ## Improvement Round 6: Google Vision API Integration (Disabled by Default)
 
@@ -430,7 +432,7 @@ All parameters at the top of `backend/ocr_engine.py`:
 
 ---
 
-## Improvement Round 7: Single-Letter Crop Isolation
+## Improvement Round 7: Single-Letter Crop Isolation (v1 → v2)
 
 **Problem:** On complex posters and specimen images, two crop issues occurred:
 1. **Multi-letter crops:** The crop around a correctly-detected single letter would show neighboring letters bleeding in.
@@ -438,16 +440,37 @@ All parameters at the top of `backend/ocr_engine.py`:
 
 **Root Cause:** `refine_bbox_by_content()` found ALL ink pixels (below luminance threshold) within the padded region. When the `CROP_BOX_MARGIN` padding captured ink from neighboring letters, the refinement expanded or shifted the crop to include that neighbor ink.
 
-**Fix — `isolate_main_component()` in `ocr_engine.py`:**
-1. After expanding the detection bbox by `CROP_BOX_MARGIN`, run `cv2.connectedComponentsWithStats` on the padded region's ink mask
-2. Find the connected component whose centroid is **closest to the center of the original detection bbox** — this is the actual detected letter
-3. Merge nearby small CCs (dots, dagesh, niqqud) that likely belong to the same letter (using `CC_MERGE_DISTANCE_X/Y`)
-4. Return only that component's tight bounding box
-5. Apply `POST_REFINE_PADDING` for breathing room
+### v1: `isolate_main_component()` (first attempt — too aggressive)
 
-Falls back to the old `refine_bbox_by_content()` if component isolation fails (e.g., no ink found).
+Picked the single CC closest to the detection center and merged nearby small CCs. This fixed multi-letter/shifted crops but introduced **over-cropping**:
+- Ascenders (ל) and descenders (ק) got cut off when they were separate CCs
+- Dots/dagesh above letters were dropped if too far from the main body center
+- Stencil fonts (letters split into multiple vertical parts) lost half the letter
 
-**Outcome:** Each crop now isolates exactly one letter, anchored to the detection center. Neighbor ink is excluded even in tightly-spaced typography.
+### v2: `refine_crop_for_letter()` (current — horizontal overlap rule)
+
+**Key insight for Hebrew:** The original Tesseract detection bbox defines the letter's **horizontal extent**. Any CC that horizontally overlaps with that bbox is part of the same letter (dots above, descenders below, stencil splits). CCs completely outside the horizontal span are neighbor letters.
+
+**Algorithm:**
+1. Expand original detection bbox by `CROP_BOX_MARGIN` → padded region
+2. Run `cv2.connectedComponentsWithStats` on the padded region's ink mask
+3. For each CC, check if its horizontal span **overlaps** with the original bbox (± `CROP_HORIZ_TOLERANCE` = 4px)
+4. **Keep** all CCs that horizontally overlap → dots, ascenders, descenders, stencil parts
+5. **Exclude** CCs completely left/right of the original bbox → neighbor letters
+6. **Never shrink smaller than the original Tesseract bbox** → prevents over-cropping
+7. Apply `POST_REFINE_PADDING` for breathing room
+
+**Why this works for Hebrew letter anatomy:**
+- **דָּ (dalet with dagesh):** dot horizontally within → KEPT
+- **שׁ (shin with dot):** dot above, horizontally within → KEPT
+- **ק (qof descender):** extends below, horizontally within → KEPT
+- **ל (lamed ascender):** extends above, horizontally within → KEPT
+- **Stencil vertical splits:** both halves share horizontal space → KEPT
+- **Neighbor letter adjacent:** completely outside horizontal span → EXCLUDED
+
+**New parameter:** `CROP_HORIZ_TOLERANCE = 4` — px tolerance for the horizontal overlap test.
+
+**Outcome:** Crops now correctly isolate single letters while preserving all letter parts (dots, stems, ascenders, descenders, stencil splits).
 
 ---
 
@@ -488,10 +511,42 @@ brew install poppler   # macOS — provides pdftoppm
 
 ---
 
+## Improvement Round 10: Polarity-Aware Crop Refinement (Otsu Auto-Threshold)
+
+**Problem:** Crop refinement was broken on images with **light text on dark backgrounds** (e.g. white letters on red poster G-HaL-21). Both `refine_bbox_by_content()` and `refine_crop_for_letter()` used a fixed luminance threshold (`region < CROP_LUM_THR=220`) to detect "ink", which assumes dark text on light background. On inverted-polarity images the code treated the dark background as ink and the light letters as empty space, causing:
+- Multi-letter crops (CC analysis found background blobs spanning multiple characters)
+- Shifted crops (bbox tightened to background rather than letter strokes)
+- Cut-off letters (the actual letter pixels were invisible to refinement)
+
+**Root cause:** A hardcoded `< 220` threshold cannot distinguish text from background when text is brighter than background.
+
+**Fix — new `_make_text_mask()` helper:**
+```python
+def _make_text_mask(self, gray_region):
+    _, binary = cv2.threshold(gray_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if np.mean(binary) > 127:
+        binary = cv2.bitwise_not(binary)
+    return (binary > 0).astype(np.uint8)
+```
+
+1. **Otsu binarization** — auto-finds the optimal threshold between text and background, no matter their absolute luminance values
+2. **Polarity normalization** — if the mean of the binary result is >127 (background is light = standard case), inverts so text becomes foreground. If mean ≤127 (background is dark = inverted case), text is already foreground
+
+Both `refine_bbox_by_content()` and `refine_crop_for_letter()` now call `_make_text_mask()` instead of the fixed threshold. The same pattern was already used in `_find_components()` for CC segmentation.
+
+**`CROP_LUM_THR` deprecated** — no longer referenced; marked as deprecated in the tunable parameters.
+
+**Also added:** Minimum region size guard (`shape[0] < 3 or shape[1] < 3`) to prevent Otsu from crashing on tiny crops.
+
+**Outcome:** Crop refinement now works correctly on both dark-on-light and light-on-dark images without any manual toggle.
+
+---
+
 ## Current Status
 
 - **Detection accuracy:** All 27 Hebrew characters (22 base + 5 final forms) detected correctly on clean typography
-- **Single-letter isolation:** Crops anchored to the main connected component closest to detection center
+- **Polarity-aware crops:** Otsu auto-threshold handles both dark-on-light and light-on-dark images — no manual inversion needed
+- **Smart crop refinement:** Horizontal-overlap filtering keeps letter parts (dots, ascenders, descenders, stencil splits) while excluding neighbor-letter text; never crops smaller than original detection bbox
 - **Mixed-script images:** Latin and non-Hebrew characters cleanly filtered out via Unicode regex
 - **Confidence scoring:** Real Tesseract confidence per character, with honest N/A for unscored
 - **Heavy fonts:** Optional thinning toggle for bold/heavy typography
@@ -508,8 +563,8 @@ These are concrete branches still worth exploring with the current architecture,
 
 ### Branch A: Adaptive Preprocessing Per Image Type (High Impact, Medium Effort)
 The current preprocessing is one-size-fits-all: CLAHE + optional thinning. Different image types need different treatment:
-- **Light fonts on dark backgrounds** — inversion before binarization
-- **Low-contrast images** — more aggressive CLAHE or adaptive thresholding (instead of Otsu)
+- ~~**Light fonts on dark backgrounds** — inversion before binarization~~ *(partially addressed by Round 10: Otsu auto-threshold now handles polarity in crop refinement)*
+- **Low-contrast images** — more aggressive CLAHE or adaptive thresholding
 - **Colored text on colored backgrounds** — color-channel separation before grayscale
 - **Noisy/textured backgrounds** — denoising (Gaussian/median blur) before binarization
 

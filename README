@@ -1,18 +1,24 @@
 # Hebrew OCR - Glyph Extraction Tool
 
-A minimal, working OCR pipeline for Hebrew typography that extracts individual glyphs (letters) from images.
+A multi-strategy OCR pipeline for Hebrew typography that extracts individual glyphs (letters) from images, PDFs, and multi-page TIFFs.
 
 ## Features
 
-- OCRs images in Hebrew
+- Multi-strategy Hebrew OCR (tries cascading approaches until one succeeds)
 - Extracts individual symbols (glyphs) as cropped PNGs
+- Supports JPEG, PNG, TIFF (multi-page), and PDF (multi-page) inputs
+- Smart crop refinement: isolates single letters, preserves dots/ascenders/descenders
+- Color or BW crop previews (toggle in UI); downloads always BW
 - Exports TSV and JSON metadata:
   - Per-image metadata (TSV + JSON)
   - Per-character bucket metadata (TSV + JSON in each char folder)
 - Two download options:
   - **By image**: All crops from each image in separate folders
   - **By character**: All crops grouped into per-glyph bucket folders
-- Two modes: Browser-based (Tesseract.js) or Python backend (two-pass Tesseract)
+- Three OCR modes:
+  - Browser-based (Tesseract.js) — no install needed
+  - Python backend (multi-strategy Tesseract) — recommended
+  - Google Cloud Vision API — optional, highest quality
 
 ## Installation & Usage
 
@@ -59,33 +65,38 @@ A minimal, working OCR pipeline for Hebrew typography that extracts individual g
    conda activate hebrew-ocr
    ```
 
-4. **Install Python dependencies using conda:**
+4. **Install Python dependencies:**
    ```bash
    cd backend
-   conda install -c conda-forge fastapi uvicorn python-multipart pillow opencv numpy -y
-   pip install pytesseract
+   pip install -r requirements.txt
    ```
-   **Note:** Most packages are available via conda-forge. `pytesseract` is installed via pip as it's a Python wrapper for Tesseract (which we already installed via Homebrew).
+   All core dependencies are tracked in `backend/requirements.txt`. Optional packages (EasyOCR, Google Cloud Vision) are listed but commented out — uncomment to install.
 
-5. **Start the backend server:**
+5. **Install poppler (required for PDF support):**
    ```bash
+   brew install poppler   # macOS
+   # sudo apt-get install poppler-utils   # Linux
+   ```
+
+6. **Start the backend server:**
+   ```bash
+   conda activate hebrew-ocr
+   cd backend
    python api.py
    ```
    (The server will run on `http://localhost:8001` - keep this terminal window open)
 
 #### Part B: Use the Frontend
 
-6. **Open the frontend:**
+7. **Open the frontend (in a second terminal):**
    - **Option A**: Open `index.html` directly in a web browser
    - **Option B**: Run `node server.js` and open `http://localhost:8000`
-
-7. **Enable backend mode:**
-   - Check the box "Use Python backend (two-pass Tesseract)"
-   - Verify the backend URL shows `http://localhost:8001` (or adjust if needed)
+   - To restart: kill the old process first (`lsof -ti :8000 | xargs kill -9`) then run `node server.js` again
 
 8. **Process images:**
-   - Select one or more image files using the file picker
-   - Optionally check/uncheck "Keep only Hebrew chars" (checked by default)
+   - Select one or more files (images, TIFFs, PDFs) using the file picker
+   - "Use Python backend" and "Keep only Hebrew chars" are checked by default
+   - Optionally toggle "Color crop previews" for color vs BW gallery display
    - Click "Run OCR"
 
 9. **Download results:**
@@ -94,7 +105,7 @@ A minimal, working OCR pipeline for Hebrew typography that extracts individual g
    - Click "Download ZIP (by image)" to get crops organized by source image
    - Click "Download ZIP (by char)" to get crops organized by character
 
-**Note:** Make sure the backend server (from step 5) is still running when you use the frontend.
+**Note:** Make sure the backend server (from step 6) is still running when you use the frontend.
 
 ---
 
@@ -105,11 +116,20 @@ A minimal, working OCR pipeline for Hebrew typography that extracts individual g
 - Direct symbol detection from full image
 - Fast setup, no installation required
 
-### Backend Mode (Two-Pass Tesseract)
-- **Pass 1**: Detects words/lines using Tesseract (PSM 6)
-- **Pass 2**: Extracts symbols from each word region (PSM 10)
-- Preprocessing: Contrast enhancement, binarization
-- Better segmentation by constraining symbol detection to word regions
+### Backend Mode (Multi-Strategy Tesseract)
+Tries three strategies in cascade until one succeeds:
+- **Strategy 1**: `image_to_boxes` PSM 6 on full image (fast path)
+- **Strategy 2**: Two-pass — PSM 6 for word regions, then PSM 7/CC segmentation per word
+- **Strategy 3**: Connected components on full image (last resort)
+
+Preprocessing: CLAHE contrast enhancement, Otsu binarization, optional morphological thinning for heavy fonts.
+
+Crop refinement: Horizontal-overlap filtering keeps letter parts (dots, ascenders, descenders, stencil splits) while excluding neighbor-letter ink.
+
+### Google Cloud Vision Mode (Optional)
+- Requires `google-cloud-vision` package + service account credentials
+- Enable via `ENABLE_GOOGLE_VISION = True` in `backend/ocr_engine.py`
+- Check both "Use Python backend" and "Use Google Cloud Vision API" in the UI
 
 ## Output Structure
 
@@ -147,17 +167,27 @@ Edit constants in `script.js`:
 - `MIN_GLYPH_SIZE_PX`: Minimum glyph size filter (default: 8px)
 
 ### Backend Mode
-Edit constants in `backend/ocr_engine.py`:
-- Same parameters as browser mode
-- `psm_word`: Page segmentation mode for Pass 1 (default: 6)
-- `psm_symbol`: Page segmentation mode for Pass 2 (default: 10)
+Edit constants at the top of `backend/ocr_engine.py`:
+- `CROP_BOX_MARGIN`: Padding around detected bbox (default: 4px)
+- `POST_REFINE_PADDING`: Padding after ink-tightening (default: 2px)
+- `CROP_LUM_THR`: Luminance threshold for ink detection (default: 220)
+- `CROP_HORIZ_TOLERANCE`: Horizontal overlap tolerance for letter-part filtering (default: 4px)
+- `MIN_CHAR_CONFIDENCE`: Drop chars below this confidence (default: 15)
+- `ENABLE_THINNING`: Morphological thinning for heavy/bold fonts (default: False)
+- `ENABLE_GOOGLE_VISION`: Google Cloud Vision API gate (default: False)
+
+See [improve_process.md](improve_process.md) for the full parameter table.
 
 ## Troubleshooting
 
 ### Backend Not Connecting
-- Make sure the backend server is running (`python3 api.py` in the `backend/` directory)
+- Make sure the backend server is running (`conda activate hebrew-ocr && python api.py` in the `backend/` directory)
 - Check the backend URL in the frontend matches your server (default: `http://localhost:8001`)
 - Check browser console for CORS errors
+
+### Port Already in Use
+- Frontend (port 8000): `lsof -ti :8000 | xargs kill -9` then `node server.js`
+- Backend (port 8001): `lsof -ti :8001 | xargs kill -9` then `conda activate hebrew-ocr && python api.py`
 
 ### Tesseract Not Found (Backend Mode)
 - Verify Tesseract is installed: `tesseract --version`
@@ -178,11 +208,13 @@ Edit constants in `backend/ocr_engine.py`:
 
 ## Future Improvements
 
-- Batch folder processing
+- Benchmark test suite (10 ground-truth images with F1 scoring)
+- Adaptive preprocessing per image type (auto-detect contrast, inversion, noise)
+- Vertical projection profiles for touching/overlapping glyph segmentation
+- EasyOCR as primary recognizer (better for stylized fonts)
 - GlyphCollector-style functions (see: https://github.com/krksgbr/glyphcollector)
 - Average glyph generation per character
-- Support for combining multiple OCR engines (EasyOCR, PaddleOCR)
-- Google Cloud Vision integration option
+- Custom classifier training from collected crops
 
 ## See Also
 
