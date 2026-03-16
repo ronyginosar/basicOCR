@@ -1,11 +1,249 @@
-minimal, working Node + Tesseract.js pipeline that:
+# Hebrew OCR - Glyph Extraction Tool
 
-OCRs a single image in Hebrew
+A multi-strategy OCR pipeline for Hebrew typography that extracts individual glyphs (letters) from images, PDFs, and multi-page TIFFs.
 
-Writes the raw TSV
+## Features
 
-Crops each symbol (glyph) to individual PNGs
+- Multi-strategy Hebrew OCR (tries cascading approaches until one succeeds)
+- Extracts individual symbols (glyphs) as cropped PNGs
+- Supports JPEG, PNG, TIFF (multi-page), and PDF (multi-page) inputs
+- Smart crop refinement: isolates single letters, preserves dots/ascenders/descenders
+- Color or BW crop previews (toggle in UI); downloads always BW
+- Exports TSV and JSON metadata:
+  - Per-image metadata (TSV + JSON)
+  - Per-character bucket metadata (TSV + JSON in each char folder)
+- Two download options:
+  - **By image**: All crops from each image in separate folders
+  - **By character**: All crops grouped into per-glyph bucket folders
+- Three OCR modes:
+  - Browser-based (Tesseract.js) — no install needed
+  - Python backend (multi-strategy Tesseract) — recommended
+  - Google Cloud Vision API — optional, highest quality
 
-Saves a compact metadata.json per crop
+## Installation & Usage
 
-Later: generalize to batch folders, per-glyph buckets, and GlyphCollector-style functions. (see : https://github.com/krksgbr/glyphcollector)
+### Option 1: Browser-Only Mode
+
+**Step-by-step instructions:**
+
+1. Open `index.html` directly in a web browser (double-click the file or `open index.html`)
+2. Select one or more image files using the file picker
+3. Optionally check/uncheck "Keep only Hebrew chars" (checked by default)
+4. Click "Run OCR"
+5. Wait for processing to complete (progress shown in log area)
+6. View glyph crops in the gallery
+7. Click "Download ZIP (by image)" to get crops organized by source image
+8. Click "Download ZIP (by char)" to get crops organized by character
+
+**Note:** This uses Tesseract.js in the browser. No installation needed, but may be slower and less accurate than the backend mode.
+
+---
+
+### Option 2: Frontend + Backend Mode (Recommended)
+
+**Step-by-step instructions:**
+
+#### Part A: Install Backend
+
+1. **Install Tesseract OCR:**
+   - **macOS**: `brew install tesseract tesseract-lang`
+   - **Linux**: `sudo apt-get install tesseract-ocr tesseract-ocr-heb`
+   - **Windows**: Download from [GitHub](https://github.com/UB-Mannheim/tesseract/wiki)
+
+2. **Verify Tesseract is installed:**
+   ```bash
+   tesseract --version
+   ```
+
+3. **Create and activate a conda environment (recommended):**
+   ```bash
+   conda create -n hebrew-ocr python=3.9
+   conda activate hebrew-ocr
+   ```
+   Or if the environment already exists:
+   ```bash
+   conda activate hebrew-ocr
+   ```
+
+4. **Install Python dependencies:**
+   ```bash
+   cd backend
+   pip install -r requirements.txt
+   ```
+   All core dependencies are tracked in `backend/requirements.txt`. Optional packages (EasyOCR, Google Cloud Vision) are listed but commented out — uncomment to install.
+
+5. **Install poppler (required for PDF support):**
+   ```bash
+   brew install poppler   # macOS
+   # sudo apt-get install poppler-utils   # Linux
+   ```
+
+6. **Start the backend server:**
+   ```bash
+   conda activate hebrew-ocr
+   cd backend
+   python api.py
+   ```
+   (The server will run on `http://localhost:8001` - keep this terminal window open)
+
+#### Part B: Use the Frontend
+
+7. **Open the frontend (in a second terminal):**
+   - **Option A**: Open `index.html` directly in a web browser
+   - **Option B**: Run `node server.js` and open `http://localhost:8000`
+   - To restart: kill the old process first (`lsof -ti :8000 | xargs kill -9`) then run `node server.js` again
+
+8. **Process images:**
+   - Select one or more files (images, TIFFs, PDFs) using the file picker
+   - "Use Python backend" and "Keep only Hebrew chars" are checked by default
+   - Optionally toggle "Color crop previews" for color vs BW gallery display
+   - Click "Run OCR"
+
+9. **Download results:**
+   - Wait for processing to complete (progress shown in log area)
+   - View glyph crops in the gallery
+   - Click "Download ZIP (by image)" to get crops organized by source image
+   - Click "Download ZIP (by char)" to get crops organized by character
+
+**Note:** Make sure the backend server (from step 6) is still running when you use the frontend.
+
+---
+
+## How It Works
+
+### Browser Mode (Tesseract.js)
+- Single-pass OCR using Tesseract.js in the browser
+- Direct symbol detection from full image
+- Fast setup, no installation required
+
+### Backend Mode (Multi-Strategy Tesseract)
+Tries three strategies in cascade until one succeeds:
+- **Strategy 1**: `image_to_boxes` PSM 6 on full image (fast path)
+- **Strategy 2**: Two-pass — PSM 6 for word regions, then PSM 7/CC segmentation per word
+- **Strategy 3**: Connected components on full image (last resort)
+
+Preprocessing: CLAHE contrast enhancement, Otsu binarization, optional morphological thinning for heavy fonts.
+
+Crop refinement: Horizontal-overlap filtering keeps letter parts (dots, ascenders, descenders, stencil splits) while excluding neighbor-letter ink.
+
+### Google Cloud Vision Mode (Optional)
+- Requires `google-cloud-vision` package + service account credentials
+- Enable via `ENABLE_GOOGLE_VISION = True` in `backend/ocr_engine.py`
+- Check both "Use Python backend" and "Use Google Cloud Vision API" in the UI
+
+## Output Structure
+
+### By Image ZIP
+```
+filename.jpg.tsv.txt                    # TSV with all glyphs from this image
+filename.jpg.metadata.symbols.json      # JSON metadata for this image
+filename.jpg_crops_symbols/
+  ├── filename_crops_00000_א.png       # Individual glyph crops
+  ├── filename_crops_00001_ב.png
+  └── ...
+```
+
+### By Character ZIP (Per-Glyph Buckets)
+```
+char_א/
+  ├── char_א.tsv.txt                    # TSV with all instances of א
+  ├── char_א.metadata.json              # JSON metadata for this character
+  ├── filename1_crops_00000_א.png      # All א glyphs from all images
+  ├── filename2_crops_00015_א.png
+  └── ...
+char_ב/
+  ├── char_ב.tsv.txt
+  ├── char_ב.metadata.json
+  └── ...
+```
+
+## Configuration
+
+### Browser Mode
+Edit constants in `script.js`:
+- `CROP_BOX_MARGIN`: Padding around Tesseract bbox (default: 4px)
+- `POST_REFINE_PADDING`: Padding after ink-tightening (default: 2px)
+- `CROP_LUM_THR`: Luminance threshold for ink detection (default: 220)
+- `MIN_GLYPH_SIZE_PX`: Minimum glyph size filter (default: 8px)
+
+### Backend Mode
+Edit constants at the top of `backend/ocr_engine.py`:
+- `CROP_BOX_MARGIN`: Padding around detected bbox (default: 4px)
+- `POST_REFINE_PADDING`: Padding after ink-tightening (default: 2px)
+- `CROP_LUM_THR`: Luminance threshold for ink detection (default: 220)
+- `CROP_HORIZ_TOLERANCE`: Horizontal overlap tolerance for letter-part filtering (default: 4px)
+- `MIN_CHAR_CONFIDENCE`: Drop chars below this confidence (default: 15)
+- `ENABLE_THINNING`: Morphological thinning for heavy/bold fonts (default: False)
+- `ENABLE_GOOGLE_VISION`: Google Cloud Vision API gate (default: False)
+
+See [improve_process.md](improve_process.md) for the full parameter table.
+
+## Troubleshooting
+
+### Backend Not Connecting
+- Make sure the backend server is running (`conda activate hebrew-ocr && python api.py` in the `backend/` directory)
+- Check the backend URL in the frontend matches your server (default: `http://localhost:8001`)
+- Check browser console for CORS errors
+
+### Port Already in Use
+- Frontend (port 8000): `lsof -ti :8000 | xargs kill -9` then `node server.js`
+- Backend (port 8001): `lsof -ti :8001 | xargs kill -9` then `conda activate hebrew-ocr && python api.py`
+
+### Tesseract Not Found (Backend Mode)
+- Verify Tesseract is installed: `tesseract --version`
+- On macOS/Linux, ensure Hebrew language data is installed
+- Check that `pytesseract` can find Tesseract (may need to set `TESSDATA_PREFIX` environment variable)
+
+### Poor Recognition Quality
+- Try backend mode (two-pass strategy often improves segmentation)
+- Adjust `CROP_LUM_THR` for better ink detection
+- Increase `CROP_BOX_MARGIN` for more padding around glyphs
+- Check that images are clear and high-resolution
+
+### Python Package Installation Errors
+- Make sure you're using Python 3.8 or higher: `python3 --version` or `python --version`
+- **Use a conda environment** (not the base environment): `conda activate hebrew-ocr`
+- Try upgrading pip: `pip install --upgrade pip`
+- If specific versions fail, the requirements.txt uses flexible version ranges (`>=`) - try installing again
+
+## Testing & Benchmarks
+
+Run the benchmark to measure OCR accuracy against ground-truth annotations:
+
+```bash
+conda activate hebrew-ocr
+cd backend
+python test_benchmark.py              # all annotated images
+python test_benchmark.py --verbose    # per-character breakdown
+python test_benchmark.py --filter specimen  # specific collection
+```
+
+See [BENCHMARK.md](BENCHMARK.md) for the full metrics guide and annotation instructions.
+
+## Training Data Export
+
+Export OCR crops as normalized training data for a custom classifier:
+
+```bash
+conda activate hebrew-ocr
+cd backend
+python export_training_data.py --images ../assets/test_images/specimen-collection/
+```
+
+Generates four variants per glyph (raw, normalized gray, binarized, inverted) organized by character. See [TRAINING_DATA.md](TRAINING_DATA.md) for the full pipeline documentation.
+
+## Future Improvements
+
+- Adaptive preprocessing per image type (auto-detect contrast, inversion, noise)
+- Vertical projection profiles for touching/overlapping glyph segmentation
+- EasyOCR as primary recognizer (better for stylized fonts)
+- GlyphCollector-style functions (see: https://github.com/krksgbr/glyphcollector)
+- Average glyph generation per character
+- Custom classifier training from collected crops
+
+## See Also
+
+- [Benchmark Documentation](BENCHMARK.md) - Ground-truth testing framework and metrics
+- [Training Data Documentation](TRAINING_DATA.md) - Export pipeline for custom classifier training
+- [Improvement Process Documentation](improve_process.md) - Detailed discussion of OCR strategies and implementation decisions
+- [Backend README](backend/README.md) - Backend API documentation

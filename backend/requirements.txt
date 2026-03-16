@@ -1,0 +1,15 @@
+# Core dependencies
+fastapi>=0.100.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+pillow>=10.0.0
+pytesseract>=0.3.10
+opencv-python>=4.8.0
+numpy>=1.24.0
+pdf2image>=1.16.0
+
+# Optional: uncomment for EasyOCR cross-reference (pulls in PyTorch, ~2GB)
+# easyocr>=1.7.0
+
+# Optional: uncomment for Google Cloud Vision API support
+# google-cloud-vision>=3.4.0

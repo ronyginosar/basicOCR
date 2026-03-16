@@ -1,5 +1,11 @@
-ocr.js
 /reference
 /assets
 /old
 /process
+/exports
+/.vscode
+/.cursor
+/backend/__pycache__/
+/backend/benchmark_results.json
+/training_data/
+/training_data_posters/

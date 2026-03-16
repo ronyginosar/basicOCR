@@ -21,10 +21,20 @@ const MIN_GLYPH_SIZE_PX    = 8;   // minimum width/height of a glyph bbox to kee
   const dlCharZipBtn = document.getElementById('dlCharZipBtn');
   // const levelSel    = document.getElementById('level');
   const onlyHebrewC = document.getElementById('onlyHebrew');
+  const useBackendC  = document.getElementById('useBackend');
+  const useGoogleVisionC = document.getElementById('useGoogleVision');
+  const colorCropsC = document.getElementById('colorCrops');
+  const backendUrlInp = document.getElementById('backendUrl');
+  const backendUrlLabel = document.getElementById('backendUrlLabel');
   // const langPathInp = document.getElementById('langPath');
   const logEl       = document.getElementById('log');
   const gallery     = document.getElementById('gallery');
   const workCanvas  = document.getElementById('workCanvas');
+
+  // Show/hide backend URL input
+  useBackendC.addEventListener('change', () => {
+    backendUrlLabel.style.display = useBackendC.checked ? 'flex' : 'none';
+  });
 
 
 
@@ -45,7 +55,10 @@ const MIN_GLYPH_SIZE_PX    = 8;   // minimum width/height of a glyph bbox to kee
     dlCharZipBtn.disabled = true;
   }
   function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
-  function fmtConf(c) { return (typeof c === 'number' && isFinite(c)) ? c.toFixed(1) : String(c ?? ''); }
+  function fmtConf(c) {
+    if (typeof c !== 'number' || !isFinite(c)) return String(c ?? '');
+    return c < 0 ? 'N/A' : c.toFixed(1);  // -1 = unscored by engine
+  }
   function safeTextForFilename(t) {
     const txt = (t || '').trim();
     const rep = txt.length ? txt.replace(/\s/g, '␠') : 'space';
@@ -113,7 +126,219 @@ function refineBoxByContent(ctx, region, thr /* 0..255 */) {
     });
   }
 
+  // Shared helper: process one page result into gallery + ZIPs
+  function processPageResult(pageResult, sourceName, pageNum, zipByImage, zipByChar, charBuckets) {
+    const useColor = !!colorCropsC.checked;
+    const pageLabel = pageNum > 0 ? ` (p${pageNum})` : '';
+
+    const filtered = pageResult.symbols.map(sym => ({
+      text: sym.text,
+      confidence: sym.confidence,
+      bbox: { x0: sym.bbox.left, y0: sym.bbox.top, x1: sym.bbox.left + sym.bbox.width, y1: sym.bbox.top + sym.bbox.height }
+    }));
+
+    const tsv = toTSV(filtered, `${sourceName}${pageLabel}`, 'symbols');
+    const metadata = {
+      source_image: sourceName, page: pageNum || 1, level: 'symbols',
+      width: pageResult.width, height: pageResult.height, count: filtered.length,
+      stats_by_char: pageResult.stats_by_char,
+      items: filtered.map((it, i) => ({
+        index: i, text: it.text, confidence: it.confidence,
+        bbox: { left: it.bbox.x0, top: it.bbox.y0, width: it.bbox.x1 - it.bbox.x0, height: it.bbox.y1 - it.bbox.y0 }
+      }))
+    };
+
+    const fileKey = pageNum > 0 ? `${sourceName}_page${pageNum}` : sourceName;
+    zipByImage.file(`${fileKey}.tsv.txt`, tsv);
+    zipByImage.file(`${fileKey}.metadata.symbols.json`, JSON.stringify(metadata, null, 2));
+
+    const baseName = fileKey.replace(/\s/g, '_');
+    const folder = zipByImage.folder(`${fileKey}_crops_symbols`);
+
+    for (let i = 0; i < pageResult.crops.length; i++) {
+      const crop = pageResult.crops[i];
+      const it = filtered[i];
+      if (!it) continue;
+
+      // BW crop for ZIP downloads (always)
+      const bwData = crop.image_data.split(',')[1];
+      const bin = atob(bwData);
+      const u8 = new Uint8Array(bin.length);
+      for (let j = 0; j < bin.length; j++) u8[j] = bin.charCodeAt(j);
+
+      // Gallery preview: color or BW based on checkbox
+      const previewSrc = (useColor && crop.image_data_color) ? crop.image_data_color : crop.image_data;
+      const card = document.createElement('div');
+      card.className = 'thumb';
+      const preview = new Image();
+      preview.src = previewSrc;
+      const metaDiv = document.createElement('div');
+      metaDiv.className = 'meta';
+      metaDiv.textContent = `#${String(i).padStart(4,'0')} | symbols${pageLabel} | ${(it.text || '').replace(/\s/g,'␠')} | conf=${fmtConf(it.confidence)}`;
+      card.appendChild(preview);
+      card.appendChild(metaDiv);
+      gallery.appendChild(card);
+
+      const fname = `${baseName}_crops_${String(i).padStart(5,'0')}_${safeTextForFilename(it.text)}.png`;
+      folder.file(fname, u8, { binary: true });
+
+      const charLabel = (it.text || '').trim();
+      const key = (charLabel && charLabel.length) ? charLabel : 'blank';
+      if (!charBuckets.has(key)) {
+        const safeLabel = safeTextForFilename(key);
+        const folderName = `char_${safeLabel}`;
+        charBuckets.set(key, { label: key, safeLabel, folderName, folder: zipByChar.folder(folderName), entries: [] });
+      }
+      const bucket = charBuckets.get(key);
+      bucket.folder.file(fname, u8, { binary: true });
+      bucket.entries.push({
+        source_image: sourceName, page: pageNum || 1, crop_filename: fname,
+        text: it.text, confidence: it.confidence,
+        bbox: { left: it.bbox.x0, top: it.bbox.y0, width: it.bbox.x1 - it.bbox.x0, height: it.bbox.y1 - it.bbox.y0 }
+      });
+    }
+
+    return filtered.length;
+  }
+
+  // Finalize per-char TSV/JSON inside each char folder
+  function finalizeCharBuckets(charBuckets) {
+    for (const bucket of charBuckets.values()) {
+      const header = 'idx\tsource_image\tcrop_filename\ttext\tconf\tleft\ttop\twidth\theight';
+      const rows = bucket.entries.map((entry, idx) => {
+        const { source_image, crop_filename, text, confidence, bbox } = entry;
+        return [idx, source_image, crop_filename, (text ?? '').replace(/\s/g, '␠'), fmtConf(confidence), bbox.left, bbox.top, bbox.width, bbox.height].join('\t');
+      });
+      bucket.folder.file(`${bucket.folderName}.tsv.txt`, [header, ...rows].join('\n'));
+      bucket.folder.file(`${bucket.folderName}.metadata.json`, JSON.stringify({ char: bucket.label, count: bucket.entries.length, items: bucket.entries }, null, 2));
+    }
+  }
+
+  // Backend API call — supports single images, multi-page PDFs, and multi-page TIFFs
+  async function runOCRBackend() {
+    clearUI();
+    const files = Array.from(fileInput.files || []);
+    if (!files.length) { log('No files selected.'); return; }
+
+    const onlyHebrew = !!onlyHebrewC.checked;
+    const backendUrl = (backendUrlInp.value || 'http://localhost:8001').trim().replace(/\/$/, '');
+
+    const zipByImage = new JSZip();
+    const zipByChar = new JSZip();
+    const charBuckets = new Map();
+
+    try {
+      for (const file of files) {
+        log(`\n=== ${file.name} ===`);
+
+        const formData = new FormData();
+        formData.append('file', file, file.name);
+        formData.append('only_hebrew', onlyHebrew);
+
+        log(`Sending to backend: ${file.name} (${file.type || 'unknown type'})...`);
+        const response = await fetch(`${backendUrl}/api/ocr/process`, {
+          method: 'POST',
+          body: formData
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({ detail: response.statusText }));
+          const errorMsg = errorData.detail || errorData.error || `${response.status} ${response.statusText}`;
+          throw new Error(`Backend error: ${errorMsg}`);
+        }
+
+        const result = await response.json();
+
+        // Normalize: multi-page response has `pages` array, single-page is the result itself
+        const pageResults = result.pages || [result];
+
+        for (let p = 0; p < pageResults.length; p++) {
+          const pageResult = pageResults[p];
+          const pageNum = pageResults.length > 1 ? (p + 1) : 0;
+          if (pageNum > 0) log(`  --- page ${pageNum}/${pageResults.length} ---`);
+          const cropCount = processPageResult(pageResult, file.name, pageNum, zipByImage, zipByChar, charBuckets);
+          log(`Crops: ${cropCount}${pageNum > 0 ? ` (page ${pageNum})` : ''}`);
+        }
+      }
+
+      finalizeCharBuckets(charBuckets);
+
+      log('Building ZIPs…');
+      lastZipBlob = await zipByImage.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      lastCharZipBlob = await zipByChar.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      dlZipBtn.disabled = false;
+      dlCharZipBtn.disabled = false;
+      log('Ready. Use the download buttons.');
+
+    } catch (err) {
+      console.error(err);
+      log('ERROR: ' + (err && err.message ? err.message : String(err)));
+      log('Make sure the backend is running at ' + backendUrl);
+    }
+  }
+
+  // Google Vision API — uses shared processPageResult helper
+  async function runOCRGoogleVision() {
+    clearUI();
+    const files = Array.from(fileInput.files || []);
+    if (!files.length) { log('No files selected.'); return; }
+
+    const onlyHebrew = !!onlyHebrewC.checked;
+    const backendUrl = (backendUrlInp.value || 'http://localhost:8001').trim().replace(/\/$/, '');
+
+    const zipByImage = new JSZip();
+    const zipByChar = new JSZip();
+    const charBuckets = new Map();
+
+    try {
+      for (const file of files) {
+        log(`\n=== ${file.name} (Google Vision) ===`);
+
+        const formData = new FormData();
+        formData.append('file', file, file.name);
+        formData.append('only_hebrew', onlyHebrew);
+
+        log(`Sending to Google Vision: ${file.name}...`);
+        const response = await fetch(`${backendUrl}/api/ocr/process-google-vision`, {
+          method: 'POST',
+          body: formData
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({ detail: response.statusText }));
+          const errorMsg = errorData.detail || errorData.error || `${response.status} ${response.statusText}`;
+          throw new Error(`Google Vision error: ${errorMsg}`);
+        }
+
+        const result = await response.json();
+        const cropCount = processPageResult(result, file.name, 0, zipByImage, zipByChar, charBuckets);
+        log(`Google Vision crops: ${cropCount}`);
+      }
+
+      finalizeCharBuckets(charBuckets);
+
+      log('Building ZIPs…');
+      lastZipBlob = await zipByImage.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      lastCharZipBlob = await zipByChar.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      dlZipBtn.disabled = false;
+      dlCharZipBtn.disabled = false;
+      log('Ready. Use the download buttons.');
+    } catch (err) {
+      console.error(err);
+      log('ERROR: ' + (err && err.message ? err.message : String(err)));
+      log('Google Vision requires: pip install google-cloud-vision + GOOGLE_APPLICATION_CREDENTIALS env var + ENABLE_GOOGLE_VISION=True in ocr_engine.py');
+    }
+  }
+
   async function runOCR() {
+    // Route to appropriate backend: Google Vision > Python backend > browser Tesseract.js
+    if (useGoogleVisionC.checked && useBackendC.checked) {
+      return runOCRGoogleVision();
+    }
+    if (useBackendC.checked) {
+      return runOCRBackend();
+    }
+
     clearUI();
 
     const files = Array.from(fileInput.files || []);
