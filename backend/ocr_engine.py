@@ -44,6 +44,10 @@ MIN_CHARS_FOR_STRATEGY = 2     # minimum chars for a strategy to be accepted
 OVERLAP_THRESHOLD = 0.45       # IoU threshold for deduplication
 CROP_HORIZ_TOLERANCE = 4       # px tolerance for horizontal overlap test when filtering neighbor CCs from crop
 DEOVERLAP_VERT_RATIO = 0.5    # minimum vertical overlap ratio to consider two bboxes on the same line
+DEOVERLAP_MAX_RATIO = 0.40    # skip de-overlap if overlap > this fraction of either bbox width (same-char detections)
+REOCR_CONFIDENCE_THRESHOLD = 60.0  # re-OCR refined crops when confidence is below this (or unscored)
+LATIN_CROSSCHECK = True            # reject detections where English OCR is more confident than Hebrew
+LATIN_CROSSCHECK_MARGIN = 5.0     # reject if eng_conf > heb_conf + this margin
 
 TESSERACT_LANG = 'heb'         # Use 'heb+eng' if you have eng traineddata for better script separation
 ENABLE_THINNING = False        # Set True for heavy/bold fonts — morphological erosion thins strokes
@@ -609,9 +613,13 @@ class HebrewOCREngine:
         Refine a crop keeping only text belonging to the detected letter.
         Uses Otsu binarization so it works for both dark-on-light and light-on-dark.
 
-        Strategy: CCs whose horizontal span overlaps the original Tesseract bbox
-        are the same letter; CCs entirely outside are neighbors to exclude.
-        Result is never smaller than the original bbox (prevents over-cropping).
+        Strategy:
+        1. Find all CCs in the padded region via Otsu text mask.
+        2. Classify CCs as "large" (character-body) or "small" (dot/niqqud).
+        3. If multiple large CCs exist, pick the one whose center is closest to
+           the original bbox center — that's the intended character.
+        4. Keep the primary CC + any small CCs horizontally aligned with it.
+        5. Result is never smaller than the original bbox.
         """
         px0, py0, px1, py1 = padded_bbox
         region = image[py0:py1, px0:px1]
@@ -626,24 +634,66 @@ class HebrewOCREngine:
         if num_labels <= 1:
             return None
 
-        # Original bbox horizontal span, relative to the padded region
-        orig_left = original_bbox[0] - px0
-        orig_right = original_bbox[2] - px0
-        tol = CROP_HORIZ_TOLERANCE
+        # Collect significant CCs with their stats
+        large_ccs = []
+        small_ccs = []
+        areas = [int(stats[lid, cv2.CC_STAT_AREA]) for lid in range(1, num_labels)
+                 if int(stats[lid, cv2.CC_STAT_AREA]) >= MIN_COMPONENT_AREA]
+        if not areas:
+            return None
+        median_area = sorted(areas)[len(areas) // 2] if areas else 0
 
-        # Keep CCs that horizontally overlap with the original bbox (± tolerance)
-        kept_mask = np.zeros_like(text_mask, dtype=bool)
         for lid in range(1, num_labels):
             area = int(stats[lid, cv2.CC_STAT_AREA])
             if area < MIN_COMPONENT_AREA:
                 continue
             cc_left = int(stats[lid, cv2.CC_STAT_LEFT])
-            cc_right = cc_left + int(stats[lid, cv2.CC_STAT_WIDTH])
+            cc_top = int(stats[lid, cv2.CC_STAT_TOP])
+            cc_w = int(stats[lid, cv2.CC_STAT_WIDTH])
+            cc_h = int(stats[lid, cv2.CC_STAT_HEIGHT])
+            cc_cx = cc_left + cc_w / 2.0
+            cc_cy = cc_top + cc_h / 2.0
+            info = {'lid': lid, 'area': area, 'left': cc_left, 'top': cc_top,
+                    'width': cc_w, 'height': cc_h, 'cx': cc_cx, 'cy': cc_cy}
+            if area < median_area * CC_SMALL_RATIO:
+                small_ccs.append(info)
+            else:
+                large_ccs.append(info)
 
-            # Horizontal overlap test: CC overlaps with original bbox
-            has_overlap = cc_right > (orig_left - tol) and cc_left < (orig_right + tol)
-            if has_overlap:
-                kept_mask |= (labels == lid)
+        if not large_ccs:
+            return None
+
+        # Original bbox center, relative to padded region
+        orig_cx = (original_bbox[0] + original_bbox[2]) / 2.0 - px0
+        orig_left = original_bbox[0] - px0
+        orig_right = original_bbox[2] - px0
+        tol = CROP_HORIZ_TOLERANCE
+
+        # Pick primary CC: closest center_x to the original bbox center
+        primary = min(large_ccs, key=lambda c: abs(c['cx'] - orig_cx))
+
+        # Build kept mask: primary CC + any large CCs that mostly overlap with
+        # primary horizontally (for stencil/split letters), + aligned small CCs
+        kept_mask = (labels == primary['lid'])
+        pri_left = primary['left']
+        pri_right = primary['left'] + primary['width']
+
+        for cc in large_ccs:
+            if cc['lid'] == primary['lid']:
+                continue
+            # Keep if this CC horizontally overlaps with the PRIMARY (not the bbox)
+            # — handles stencil fonts where one letter splits into 2+ large CCs
+            cc_r = cc['left'] + cc['width']
+            overlap = min(pri_right, cc_r) - max(pri_left, cc['left'])
+            if overlap > min(primary['width'], cc['width']) * 0.3:
+                kept_mask |= (labels == cc['lid'])
+
+        for cc in small_ccs:
+            # Keep small CCs (dots/niqqud) that are horizontally within the primary
+            cc_r = cc['left'] + cc['width']
+            horiz_overlap = cc_r > (pri_left - tol) and cc['left'] < (pri_right + tol)
+            if horiz_overlap:
+                kept_mask |= (labels == cc['lid'])
 
         if not np.any(kept_mask):
             return None
@@ -655,17 +705,8 @@ class HebrewOCREngine:
         y_min, y_max = np.where(rows)[0][[0, -1]]
         x_min, x_max = np.where(cols)[0][[0, -1]]
 
-        refined = (int(px0 + x_min), int(py0 + y_min),
-                   int(px0 + x_max + 1), int(py0 + y_max + 1))
-
-        # Never crop smaller than the original bbox (prevents over-cropping)
-        final = (
-            min(refined[0], original_bbox[0]),
-            min(refined[1], original_bbox[1]),
-            max(refined[2], original_bbox[2]),
-            max(refined[3], original_bbox[3])
-        )
-        return final
+        return (int(px0 + x_min), int(py0 + y_min),
+                int(px0 + x_max + 1), int(py0 + y_max + 1))
 
     def expand_box(self, bbox: Tuple, margin: int, max_w: int, max_h: int) -> Tuple:
         """Expand bounding box by margin, clamped to image bounds."""
@@ -698,31 +739,61 @@ class HebrewOCREngine:
 
     def _deoverlap_bboxes(self, symbols: List[Dict]) -> List[Dict]:
         """
-        Split horizontally overlapping bboxes at the midpoint of their overlap.
-        Prevents one letter's crop from bleeding into a neighbor when Tesseract
-        gives imprecise, overlapping bounding boxes.
+        Group symbols by text line, then split horizontally overlapping bboxes
+        at the midpoint. Marks affected symbols with '_deoverlapped' flag so
+        re-OCR can fix their labels.
         """
         if len(symbols) <= 1:
             return symbols
-        sorted_syms = sorted(symbols, key=lambda s: s['bbox'][0])
-        for i in range(len(sorted_syms) - 1):
-            ax0, ay0, ax1, ay1 = sorted_syms[i]['bbox']
-            bx0, by0, bx1, by1 = sorted_syms[i + 1]['bbox']
 
-            vert_overlap = min(ay1, by1) - max(ay0, by0)
-            min_height = min(ay1 - ay0, by1 - by0)
-            if min_height <= 0 or vert_overlap < min_height * DEOVERLAP_VERT_RATIO:
-                continue
+        # Group into text lines by vertical midpoint (cluster within half median height)
+        for s in symbols:
+            s['_vmid'] = (s['bbox'][1] + s['bbox'][3]) / 2.0
+        heights = [s['bbox'][3] - s['bbox'][1] for s in symbols]
+        merge_thresh = sorted(heights)[len(heights) // 2] * 0.5 if heights else 50
 
-            horiz_overlap = min(ax1, bx1) - max(ax0, bx0)
-            if horiz_overlap <= 0:
-                continue
+        sorted_by_y = sorted(symbols, key=lambda s: s['_vmid'])
+        lines = []
+        current_line = [sorted_by_y[0]]
+        for s in sorted_by_y[1:]:
+            if abs(s['_vmid'] - current_line[0]['_vmid']) < merge_thresh:
+                current_line.append(s)
+            else:
+                lines.append(current_line)
+                current_line = [s]
+        lines.append(current_line)
 
-            mid = (max(ax0, bx0) + min(ax1, bx1)) // 2
-            sorted_syms[i]['bbox'] = (ax0, ay0, mid, ay1)
-            sorted_syms[i + 1]['bbox'] = (mid, by0, bx1, by1)
-            print(f"[DEOVERLAP] split '{sorted_syms[i]['text']}'/'{sorted_syms[i+1]['text']}' at x={mid}")
-        return sorted_syms
+        # Within each line, sort by x0 and split overlapping adjacent pairs
+        for line in lines:
+            line.sort(key=lambda s: s['bbox'][0])
+            for i in range(len(line) - 1):
+                ax0, ay0, ax1, ay1 = line[i]['bbox']
+                bx0, by0, bx1, by1 = line[i + 1]['bbox']
+
+                horiz_overlap = min(ax1, bx1) - max(ax0, bx0)
+                if horiz_overlap <= 0:
+                    continue
+
+                # Skip if overlap is too large relative to either bbox — likely
+                # two detections of the same character, not adjacent letters
+                a_width = ax1 - ax0
+                b_width = bx1 - bx0
+                if a_width > 0 and horiz_overlap / a_width > DEOVERLAP_MAX_RATIO:
+                    continue
+                if b_width > 0 and horiz_overlap / b_width > DEOVERLAP_MAX_RATIO:
+                    continue
+
+                mid = (max(ax0, bx0) + min(ax1, bx1)) // 2
+                line[i]['bbox'] = (ax0, ay0, mid, ay1)
+                line[i + 1]['bbox'] = (mid, by0, bx1, by1)
+                line[i]['_deoverlapped'] = True
+                line[i + 1]['_deoverlapped'] = True
+                print(f"[DEOVERLAP] split '{line[i]['text']}'/'{line[i+1]['text']}' at x={mid}")
+
+        # Clean up temp keys
+        for s in symbols:
+            s.pop('_vmid', None)
+        return symbols
 
     # ──────────────────────────────────────────────────
     # Main pipeline
@@ -833,14 +904,84 @@ class HebrewOCREngine:
                 refine_method = "fallback_expanded"
 
             final = self.expand_box(tight, POST_REFINE_PADDING, img_w, img_h)
-            print(f"[REFINE] '{sym['text']}' orig={orig} expanded={expanded} tight={tight} final={final} method={refine_method}")
+            # Verbose: uncomment for debugging crop refinement
+            # print(f"[REFINE] '{sym['text']}' orig={orig} expanded={expanded} tight={tight} final={final} method={refine_method}")
             refined.append({
                 'text': sym['text'],
                 'confidence': float(sym['confidence']),
                 'bbox': tuple(int(v) for v in final),
                 'bbox_original': tuple(int(v) for v in sym['bbox']),
-                'method': sym.get('method', 'unknown')
+                'method': sym.get('method', 'unknown'),
+                '_deoverlapped': sym.get('_deoverlapped', False)
             })
+
+        # ── Re-OCR: re-identify low-confidence, unscored, or de-overlapped crops ──
+        reocr_count = 0
+        for sym in refined:
+            needs_reocr = (sym['confidence'] == CONFIDENCE_UNSCORED
+                           or sym['confidence'] < REOCR_CONFIDENCE_THRESHOLD
+                           or sym.get('_deoverlapped', False))
+            if not needs_reocr:
+                continue
+            x0, y0, x1, y1 = sym['bbox']
+            crop = img_pre[y0:y1, x0:x1]
+            if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
+                continue
+            try:
+                data = pytesseract.image_to_data(
+                    crop, lang=TESSERACT_LANG, config='--psm 10',
+                    output_type=pytesseract.Output.DICT)
+                for i, text in enumerate(data['text']):
+                    text = text.strip()
+                    if not text or len(text) != 1:
+                        continue
+                    conf = float(data['conf'][i])
+                    if conf > 0 and HEBREW_REGEX.search(text):
+                        old_text, old_conf = sym['text'], sym['confidence']
+                        sym['text'] = text
+                        sym['confidence'] = conf
+                        sym['method'] += '+reocr'
+                        reocr_count += 1
+                        print(f"[REOCR] '{old_text}'(conf={old_conf:.0f}) → '{text}'(conf={conf:.0f})")
+                        break
+            except Exception:
+                pass
+        if reocr_count:
+            print(f"[OCR] Re-OCR improved {reocr_count} detections")
+
+        # ── Re-run Hebrew filter after re-OCR (labels may have changed) ──
+        if only_hebrew:
+            refined = [s for s in refined if HEBREW_REGEX.search(s['text'])]
+
+        # ── Latin cross-check: reject detections where English OCR is more confident ──
+        if only_hebrew and LATIN_CROSSCHECK:
+            kept = []
+            for sym in refined:
+                x0, y0, x1, y1 = sym['bbox']
+                crop = img_pre[y0:y1, x0:x1]
+                if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
+                    kept.append(sym)
+                    continue
+                heb_conf = sym['confidence']
+                eng_conf = -1.0
+                try:
+                    data = pytesseract.image_to_data(
+                        crop, lang='eng', config='--psm 10',
+                        output_type=pytesseract.Output.DICT)
+                    for i, text in enumerate(data['text']):
+                        text = text.strip()
+                        if text and len(text) == 1 and text.isalpha():
+                            eng_conf = float(data['conf'][i])
+                            break
+                except Exception:
+                    pass
+                if eng_conf > 0 and eng_conf > heb_conf + LATIN_CROSSCHECK_MARGIN:
+                    print(f"[LATIN-REJECT] '{sym['text']}'(heb={heb_conf:.0f}) beaten by eng={eng_conf:.0f} → dropped")
+                else:
+                    kept.append(sym)
+            if len(kept) < len(refined):
+                print(f"[OCR] Latin cross-check: rejected {len(refined) - len(kept)} Latin detections")
+            refined = kept
 
         # ── Per-character stats ──
         char_stats = {}
@@ -862,6 +1003,9 @@ class HebrewOCREngine:
             method_counts[m] = method_counts.get(m, 0) + 1
             print(f"  '{sym['text']}' conf={sym['confidence']:.0f} bbox={sym['bbox']} via {m}")
         print(f"[OCR] Methods used: {method_counts}")
+
+        for sym in refined:
+            sym.pop('_deoverlapped', None)
 
         return {
             'source_image': image_path,

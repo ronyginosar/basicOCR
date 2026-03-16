@@ -1,5 +1,42 @@
 # OCR Improvement Process Discussion
 
+---
+
+## Immediate Future Steps: Improving Poster OCR
+
+**Context:** Benchmark testing revealed that complex illustrated posters (e.g., G-WeE-Pos-013 at F1=0.09) are near-total failures. The dominant factor is **contrast and background complexity**, not font style or resolution.
+
+**Why posters fail:** The current pipeline runs Tesseract on the full image. On posters, text is typically a small fraction (~20-30%) of the image — the rest is illustration, color blocks, faces, etc. CLAHE preprocessing spreads its enhancement across the entire image, diluting contrast where it matters (the text region). Tesseract struggles to detect characters amid visual noise.
+
+**What Round 10 addressed (and what it didn't):**
+- Polarity-aware crop refinement (Otsu) — fixes crops once characters are found, but doesn't help Tesseract FIND them
+- Latin cross-check — filters misidentified Latin, but can't recover missed Hebrew detections
+- The bottleneck is **initial detection**, not refinement
+
+**Proposed improvements (ordered by impact):**
+
+1. **Text Region Isolation** (High Impact)
+   - Detect where text lives in the image (e.g., the brown strip at the bottom of a poster)
+   - Crop to text region(s), then run OCR on those regions only
+   - Approach: Use Tesseract's `image_to_osd` or contour analysis to find text blocks; or use EAST/CRAFT text detectors
+   - This alone would dramatically improve poster detection since Tesseract would see clean text instead of faces
+
+2. **Adaptive Preprocessing Per Region** (Medium Impact)
+   - Different image regions need different treatment: text-on-brown needs different CLAHE than text-on-white
+   - Run CLAHE/binarization per text region rather than globally
+   - Ties into Branch A from the improvement roadmap
+
+3. **DPI Normalization / Upscaling** (Medium Impact)
+   - Poster text is often small relative to image dimensions
+   - Upscale detected text regions to a normalized DPI (e.g., 300 DPI equivalent) before character-level OCR
+   - Particularly helps low-resolution poster scans
+
+4. **Color Channel Separation** (Lower Impact)
+   - White text on colored backgrounds may separate better in a specific color channel (e.g., L channel from LAB, or V from HSV) rather than simple RGB-to-gray
+   - Could be part of the adaptive preprocessing step
+
+---
+
 ## Initial Question: Why is Google Lens/Translate Better Than Tesseract?
 
 **Question:** Before we try to add preprocessing, let's rethink the tesseract. What OCR libraries are there without extra training, also for hebrew. The thing to think about is that google lens and google translate handles all these test images really well compared to tesseract. Why?
@@ -406,6 +443,11 @@ All parameters at the top of `backend/ocr_engine.py`:
 | `MIN_CHARS_FOR_STRATEGY` | 2 | Minimum chars for a strategy to be accepted |
 | `OVERLAP_THRESHOLD` | 0.45 | IoU threshold for deduplication |
 | `CROP_HORIZ_TOLERANCE` | 4 | px tolerance for horizontal overlap test in crop refinement |
+| `DEOVERLAP_VERT_RATIO` | 0.5 | Min vertical overlap ratio to consider two bboxes on the same line |
+| `DEOVERLAP_MAX_RATIO` | 0.40 | Skip de-overlap if overlap > this fraction of either bbox width |
+| `REOCR_CONFIDENCE_THRESHOLD` | 60.0 | Re-OCR refined crops below this confidence (or unscored/de-overlapped) |
+| `LATIN_CROSSCHECK` | True | Reject detections where English OCR beats Hebrew confidence |
+| `LATIN_CROSSCHECK_MARGIN` | 5.0 | Rejection margin: eng_conf must exceed heb_conf by this amount |
 | `TESSERACT_LANG` | 'heb' | Language model (use 'heb+eng' for mixed scripts) |
 | `ENABLE_THINNING` | False | Morphological erosion for heavy/bold fonts |
 | `THINNING_KERNEL_SIZE` | 2 | Erosion kernel size (larger = more thinning) |
@@ -511,49 +553,90 @@ brew install poppler   # macOS — provides pdftoppm
 
 ---
 
-## Improvement Round 10: Polarity-Aware Crop Refinement (Otsu Auto-Threshold)
+## Improvement Round 10: Crop Refinement Overhaul (5 sub-fixes)
 
-**Problem:** Crop refinement was broken on images with **light text on dark backgrounds** (e.g. white letters on red poster G-HaL-21). Both `refine_bbox_by_content()` and `refine_crop_for_letter()` used a fixed luminance threshold (`region < CROP_LUM_THR=220`) to detect "ink", which assumes dark text on light background. On inverted-polarity images the code treated the dark background as ink and the light letters as empty space, causing:
-- Multi-letter crops (CC analysis found background blobs spanning multiple characters)
-- Shifted crops (bbox tightened to background rather than letter strokes)
-- Cut-off letters (the actual letter pixels were invisible to refinement)
+This round addressed multiple crop quality issues found by testing on G-HaL-21 (white-on-red poster) and פרמז׳אנו (mixed Hebrew+Latin specimen). The fixes build on each other.
 
-**Root cause:** A hardcoded `< 220` threshold cannot distinguish text from background when text is brighter than background.
+### 10a. Polarity-Aware Text Mask (Otsu Auto-Threshold)
 
-**Fix — new `_make_text_mask()` helper:**
-```python
-def _make_text_mask(self, gray_region):
-    _, binary = cv2.threshold(gray_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(binary) > 127:
-        binary = cv2.bitwise_not(binary)
-    return (binary > 0).astype(np.uint8)
-```
+**Problem:** `refine_bbox_by_content()` and `refine_crop_for_letter()` used `region < CROP_LUM_THR=220` to find ink — assumes dark text on light background. On white-on-red images, the background was detected as ink.
 
-1. **Otsu binarization** — auto-finds the optimal threshold between text and background, no matter their absolute luminance values
-2. **Polarity normalization** — if the mean of the binary result is >127 (background is light = standard case), inverts so text becomes foreground. If mean ≤127 (background is dark = inverted case), text is already foreground
+**Fix:** New `_make_text_mask()` helper uses Otsu binarization + polarity normalization. Automatically handles both dark-on-light and light-on-dark.
 
-Both `refine_bbox_by_content()` and `refine_crop_for_letter()` now call `_make_text_mask()` instead of the fixed threshold. The same pattern was already used in `_find_components()` for CC segmentation.
+**`CROP_LUM_THR` deprecated** — replaced by Otsu auto-threshold.
 
-**`CROP_LUM_THR` deprecated** — no longer referenced; marked as deprecated in the tunable parameters.
+### 10b. Center-Based CC Selection
 
-**Also added:** Minimum region size guard (`shape[0] < 3 or shape[1] < 3`) to prevent Otsu from crashing on tiny crops.
+**Problem:** The original `refine_crop_for_letter()` kept ALL CCs that horizontally overlapped with the original Tesseract bbox. When the bbox was too wide (spanning two letters), both letters' CCs were kept → multi-letter crops.
 
-**Outcome:** Crop refinement now works correctly on both dark-on-light and light-on-dark images without any manual toggle.
+**Fix:** Rewrote CC selection logic:
+1. Classify CCs as "large" (character body) vs "small" (dots/niqqud) using median area
+2. Pick the **primary CC** — the large CC whose center_x is closest to the bbox center_x (= the intended character)
+3. Keep the primary + any large CCs that horizontally overlap with the primary (handles stencil splits) + aligned small CCs (handles dots/dagesh)
+
+This correctly isolates one letter even when the Tesseract bbox spans two.
+
+### 10c. Removed "Never Smaller Than Original" Rule
+
+**Problem:** After CC selection correctly found a single letter, the old rule `final = union(refined, original_bbox)` forced the crop back to the full (too-wide) original Tesseract bbox — defeating the entire refinement.
+
+**Fix:** Removed the union rule. The crop is now the CC extent + `POST_REFINE_PADDING`. The CC selection is trusted as the source of truth.
+
+### 10d. Line-Grouped De-Overlap with Max-Ratio Guard
+
+**Problem 1:** `_deoverlap_bboxes()` checked adjacent pairs in global x-sorted order. Symbols on different text lines (e.g., ח at y=1050 between ל at y=90 and א at y=90) broke adjacency — overlapping same-line pairs were never checked.
+
+**Fix 1:** Group symbols into text lines by vertical midpoint, then check adjacent pairs within each line.
+
+**Problem 2:** De-overlap naively split at the midpoint even when two detections were detecting the SAME character (e.g., Tesseract detecting both 'א' and 'ו' on the same aleph glyph with overlapping bboxes). Splitting cut through the character → over-cropping.
+
+**Fix 2:** Added `DEOVERLAP_MAX_RATIO = 0.40` guard — skip de-overlap if the overlap exceeds 40% of either bbox's width. Large overlaps indicate same-character detections (handled by CC selection), not adjacent letters.
+
+De-overlapped symbols are flagged with `_deoverlapped = True` so they get re-OCR'd regardless of confidence (since their labels may be wrong after the bbox split).
+
+### 10e. Re-OCR on Refined Crops
+
+**Problem:** Tesseract's initial detection labels are often wrong for low-confidence or de-overlapped detections. After crop refinement the crop is cleaner — a second-pass recognition on the isolated letter can improve both the label and confidence.
+
+**Fix:** After refinement, re-run `pytesseract.image_to_data(crop, lang='heb', config='--psm 10')` on any detection where:
+- Confidence is `CONFIDENCE_UNSCORED` (-1)
+- Confidence is below `REOCR_CONFIDENCE_THRESHOLD` (60)
+- The symbol was de-overlapped
+
+If re-OCR returns a Hebrew character with positive confidence, the label and confidence are updated. Method is tagged with `+reocr` (e.g., `boxes_psm6+reocr`).
+
+**Result:** On G-HaL-21, re-OCR corrected ו→א and recovered confidence for previously-unscored detections.
+
+### 10f. Latin Cross-Check Rejection
+
+**Problem:** On images with mixed Hebrew + Latin text (e.g., "פרמז׳אנו / PARMIGIANO"), Tesseract with `lang='heb'` outputs Hebrew labels for Latin characters (e.g., Latin 'P' → 'ל', Latin 'a' → 'ה'). The Hebrew Unicode filter can't help because the labels are already Hebrew.
+
+**Fix:** When `only_hebrew=True` and `LATIN_CROSSCHECK=True`, each final detection is cross-checked with `lang='eng' --psm 10`. If English OCR returns a single Latin letter with confidence exceeding the Hebrew confidence by `LATIN_CROSSCHECK_MARGIN` (5 points), the detection is rejected as Latin.
+
+**Result:** On the פרמז׳אנו specimen, 4 out of 7 Latin misdetections were correctly rejected. The remaining 3 had very low confidence from both languages, making them harder to distinguish (future improvement area).
 
 ---
 
 ## Current Status
 
 - **Detection accuracy:** All 27 Hebrew characters (22 base + 5 final forms) detected correctly on clean typography
-- **Polarity-aware crops:** Otsu auto-threshold handles both dark-on-light and light-on-dark images — no manual inversion needed
-- **Smart crop refinement:** Horizontal-overlap filtering keeps letter parts (dots, ascenders, descenders, stencil splits) while excluding neighbor-letter text; never crops smaller than original detection bbox
-- **Mixed-script images:** Latin and non-Hebrew characters cleanly filtered out via Unicode regex
+- **Polarity-aware crops:** Otsu auto-threshold handles both dark-on-light and light-on-dark images
+- **Smart crop refinement:** Center-based CC selection isolates the intended character even when Tesseract bboxes overlap; dots, ascenders, stencil splits preserved
+- **De-overlap with guard:** Splits truly adjacent overlapping bboxes but skips same-character detections (overlap > 40% of either width)
+- **Re-OCR on refined crops:** Second-pass recognition improves labels and confidence for low-confidence, unscored, and de-overlapped detections
+- **Latin cross-check:** Rejects Latin characters misidentified as Hebrew by comparing English vs Hebrew OCR confidence
+- **Mixed-script images:** Latin and non-Hebrew characters filtered via Unicode regex + Latin cross-check
 - **Confidence scoring:** Real Tesseract confidence per character, with honest N/A for unscored
 - **Heavy fonts:** Optional thinning toggle for bold/heavy typography
 - **Multi-strategy cascade:** Automatically selects the best extraction approach per image
 - **PDF & multi-page TIFF:** Automatically split into per-page processing
 - **Color previews:** Gallery shows color crops by default, downloads always BW
 - **Google Vision:** Available as optional engine (disabled by default, requires credentials)
+
+### Known Limitations (after Round 10)
+- **Tesseract character confusion:** Similar vertical-stroke letters (ו/נ/ז) are often misidentified — a Tesseract model limitation, not fixable by crop refinement
+- **Latin cross-check incomplete:** Low-confidence detections where both Hebrew and English OCR score poorly may survive — could be improved by line-level script detection
+- **Missing detections:** Some characters may not be detected at all (e.g., ו in פרמז׳אנו) — requires better Tesseract configuration or ensemble with EasyOCR
 
 ---
 

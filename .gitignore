@@ -1,4 +1,3 @@
-ocr.js
 /reference
 /assets
 /old
@@ -7,3 +6,6 @@ ocr.js
 /.vscode
 /.cursor
 /backend/__pycache__/
+/backend/benchmark_results.json
+/training_data/
+/training_data_posters/

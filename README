@@ -206,9 +206,34 @@ See [improve_process.md](improve_process.md) for the full parameter table.
 - Try upgrading pip: `pip install --upgrade pip`
 - If specific versions fail, the requirements.txt uses flexible version ranges (`>=`) - try installing again
 
+## Testing & Benchmarks
+
+Run the benchmark to measure OCR accuracy against ground-truth annotations:
+
+```bash
+conda activate hebrew-ocr
+cd backend
+python test_benchmark.py              # all annotated images
+python test_benchmark.py --verbose    # per-character breakdown
+python test_benchmark.py --filter specimen  # specific collection
+```
+
+See [BENCHMARK.md](BENCHMARK.md) for the full metrics guide and annotation instructions.
+
+## Training Data Export
+
+Export OCR crops as normalized training data for a custom classifier:
+
+```bash
+conda activate hebrew-ocr
+cd backend
+python export_training_data.py --images ../assets/test_images/specimen-collection/
+```
+
+Generates four variants per glyph (raw, normalized gray, binarized, inverted) organized by character. See [TRAINING_DATA.md](TRAINING_DATA.md) for the full pipeline documentation.
+
 ## Future Improvements
 
-- Benchmark test suite (10 ground-truth images with F1 scoring)
 - Adaptive preprocessing per image type (auto-detect contrast, inversion, noise)
 - Vertical projection profiles for touching/overlapping glyph segmentation
 - EasyOCR as primary recognizer (better for stylized fonts)
@@ -218,5 +243,7 @@ See [improve_process.md](improve_process.md) for the full parameter table.
 
 ## See Also
 
+- [Benchmark Documentation](BENCHMARK.md) - Ground-truth testing framework and metrics
+- [Training Data Documentation](TRAINING_DATA.md) - Export pipeline for custom classifier training
 - [Improvement Process Documentation](improve_process.md) - Detailed discussion of OCR strategies and implementation decisions
 - [Backend README](backend/README.md) - Backend API documentation
